@@ -274,6 +274,106 @@ fmv_x_d          11100010 0000aaaa a000bbbb b1010011, b:rd, a:f_rs1
 fcvt_d_l         11010010 0010aaaa abbbcccc c1010011, c:f_rd, a:rs1, b:rm
 fcvt_d_lu        11010010 0011aaaa abbbcccc c1010011, c:f_rd, a:rs1, b:rm
 fmv_d_x          11110010 0000aaaa a000bbbb b1010011, b:f_rd, a:rs1
+#
+# Zba Standard Extension for Address Generation
+add_uw           0000100a aaaabbbb b000cccc c0111011, a:rs2, b:rs1, c:rd
+sh1add           0010000a aaaabbbb b010cccc c0110011, a:rs2, b:rs1, c:rd
+sh1add_uw        0010000a aaaabbbb b010cccc c0111011, a:rs2, b:rs1, c:rd
+sh2add           0010000a aaaabbbb b100cccc c0110011, a:rs2, b:rs1, c:rd
+sh2add_uw        0010000a aaaabbbb b100cccc c0111011, a:rs2, b:rs1, c:rd
+sh3add           0010000a aaaabbbb b110cccc c0110011, a:rs2, b:rs1, c:rd
+sh3add_uw        0010000a aaaabbbb b110cccc c0111011, a:rs2, b:rs1, c:rd
+slli_uw          000010aa aaaabbbb b001cccc c0011011, a:shamt, b:rs1, c:rd
+#
+# Zbb Standard Extension for Basic Bit-Manipulation
+andn             0100000a aaaabbbb b111cccc c0110011, a:rs2, b:rs1, c:rd
+orn              0100000a aaaabbbb b110cccc c0110011, a:rs2, b:rs1, c:rd
+xnor             0100000a aaaabbbb b100cccc c0110011, a:rs2, b:rs1, c:rd
+clz              01100000 0000aaaa a001bbbb b0010011, a:rs1, b:rd
+clzw             01100000 0000aaaa a001bbbb b0011011, a:rs1, b:rd
+ctz              01100000 0001aaaa a001bbbb b0010011, a:rs1, b:rd
+ctzw             01100000 0001aaaa a001bbbb b0011011, a:rs1, b:rd
+cpop             01100000 0010aaaa a001bbbb b0010011, a:rs1, b:rd
+cpopw            01100000 0010aaaa a001bbbb b0011011, a:rs1, b:rd
+max              0000101a aaaabbbb b110cccc c0110011, a:rs2, b:rs1, c:rd
+maxu             0000101a aaaabbbb b111cccc c0110011, a:rs2, b:rs1, c:rd
+min              0000101a aaaabbbb b100cccc c0110011, a:rs2, b:rs1, c:rd
+minu             0000101a aaaabbbb b101cccc c0110011, a:rs2, b:rs1, c:rd
+sext_b           01100000 0100aaaa a001bbbb b0010011, a:rs1, b:rd
+sext_h           01100000 0101aaaa a001bbbb b0010011, a:rs1, b:rd
+zext_h           00001000 0000aaaa a100bbbb b0111011, a:rs1, b:rd
+rol              0110000a aaaabbbb b001cccc c0110011, a:rs2, b:rs1, c:rd
+rolw             0110000a aaaabbbb b001cccc c0111011, a:rs2, b:rs1, c:rd
+ror              0110000a aaaabbbb b101cccc c0110011, a:rs2, b:rs1, c:rd
+rorw             0110000a aaaabbbb b101cccc c0111011, a:rs2, b:rs1, c:rd
+rori             011000aa aaaabbbb b101cccc c0010011, a:shamt, b:rs1, c:rd
+roriw            0110000a aaaabbbb b101cccc c0011011, a:shamt, b:rs1, c:rd
+orc_b            00101000 0111aaaa a101bbbb b0010011, a:rs1, b:rd
+rev8             01101011 1000aaaa a101bbbb b0010011, a:rs1, b:rd
+#
+# Zbc Standard Extension for Carry-less Multiplication
+clmul            0000101a aaaabbbb b001cccc c0110011, a:rs2, b:rs1, c:rd
+clmulh           0000101a aaaabbbb b011cccc c0110011, a:rs2, b:rs1, c:rd
+clmulr           0000101a aaaabbbb b010cccc c0110011, a:rs2, b:rs1, c:rd
+#
+# Zbs Standard Extension for Single-Bit Instructions
+bclr             0100100a aaaabbbb b001cccc c0110011, a:rs2, b:rs1, c:rd
+bclri            010010aa aaaabbbb b001cccc c0010011, a:shamt, b:rs1, c:rd
+bext             0100100a aaaabbbb b101cccc c0110011, a:rs2, b:rs1, c:rd
+bexti            010010aa aaaabbbb b101cccc c0010011, a:shamt, b:rs1, c:rd
+binv             0110100a aaaabbbb b001cccc c0110011, a:rs2, b:rs1, c:rd
+binvi            011010aa aaaabbbb b001cccc c0010011, a:shamt, b:rs1, c:rd
+bset             0010100a aaaabbbb b001cccc c0110011, a:rs2, b:rs1, c:rd
+bseti            001010aa aaaabbbb b001cccc c0010011, a:shamt, b:rs1, c:rd
+#
+# Zicbom / Zicbop / Zicboz Standard Extensions for Cache-Block Operations
+cbo_clean        00000000 0001aaaa a0100000 00001111, a:rs1
+cbo_flush        00000000 0010aaaa a0100000 00001111, a:rs1
+cbo_inval        00000000 0000aaaa a0100000 00001111, a:rs1
+cbo_zero         00000000 0100aaaa a0100000 00001111, a:rs1
+prefetch_i       aaaaaaa0 0000bbbb b1100000 00010011, a:offset, b:rs1
+prefetch_r       aaaaaaa0 0001bbbb b1100000 00010011, a:offset, b:rs1
+prefetch_w       aaaaaaa0 0011bbbb b1100000 00010011, a:offset, b:rs1
+#
+# Zicond Standard Extension for Integer Conditional Operations
+czero_eqz        0000111a aaaabbbb b101cccc c0110011, a:rs2, b:rs1, c:rd
+czero_nez        0000111a aaaabbbb b111cccc c0110011, a:rs2, b:rs1, c:rd
+#
+# Zfh / Zfhmin Standard Extensions for Half-Precision Floating-Point
+flh              aaaaaaaa aaaabbbb b001cccc c0000111, a:offset, b:rs1, c:f_rd
+fsh              aaaaaaab bbbbcccc c001dddd d0100111, a:offsethi, b:f_rs2, c:rs1, d:offsetlo
+fmadd_h          aaaaa10b bbbbcccc cdddeeee e1000011, a:f_rs3, b:f_rs2, c:f_rs1, d:rm, e:f_rd
+fmsub_h          aaaaa10b bbbbcccc cdddeeee e1000111, a:f_rs3, b:f_rs2, c:f_rs1, d:rm, e:f_rd
+fnmsub_h         aaaaa10b bbbbcccc cdddeeee e1001011, a:f_rs3, b:f_rs2, c:f_rs1, d:rm, e:f_rd
+fnmadd_h         aaaaa10b bbbbcccc cdddeeee e1001111, a:f_rs3, b:f_rs2, c:f_rs1, d:rm, e:f_rd
+fadd_h           0000010a aaaabbbb bcccdddd d1010011, a:f_rs2, b:f_rs1, c:rm, d:f_rd
+fsub_h           0000110a aaaabbbb bcccdddd d1010011, a:f_rs2, b:f_rs1, c:rm, d:f_rd
+fmul_h           0001010a aaaabbbb bcccdddd d1010011, a:f_rs2, b:f_rs1, c:rm, d:f_rd
+fdiv_h           0001110a aaaabbbb bcccdddd d1010011, a:f_rs2, b:f_rs1, c:rm, d:f_rd
+fsqrt_h          01011100 0000aaaa abbbcccc c1010011, a:f_rs1, b:rm, c:f_rd
+fsgnj_h          0010010a aaaabbbb b000cccc c1010011, a:f_rs2, b:f_rs1, c:f_rd
+fsgnjn_h         0010010a aaaabbbb b001cccc c1010011, a:f_rs2, b:f_rs1, c:f_rd
+fsgnjx_h         0010010a aaaabbbb b010cccc c1010011, a:f_rs2, b:f_rs1, c:f_rd
+fmin_h           0010110a aaaabbbb b000cccc c1010011, a:f_rs2, b:f_rs1, c:f_rd
+fmax_h           0010110a aaaabbbb b001cccc c1010011, a:f_rs2, b:f_rs1, c:f_rd
+fcvt_s_h         01000000 0010aaaa abbbcccc c1010011, a:f_rs1, b:rm, c:f_rd
+fcvt_h_s         01000100 0000aaaa abbbcccc c1010011, a:f_rs1, b:rm, c:f_rd
+fcvt_d_h         01000010 0010aaaa abbbcccc c1010011, a:f_rs1, b:rm, c:f_rd
+fcvt_h_d         01000100 0001aaaa abbbcccc c1010011, a:f_rs1, b:rm, c:f_rd
+feq_h            1010010a aaaabbbb b010cccc c1010011, a:f_rs2, b:f_rs1, c:rd
+flt_h            1010010a aaaabbbb b001cccc c1010011, a:f_rs2, b:f_rs1, c:rd
+fle_h            1010010a aaaabbbb b000cccc c1010011, a:f_rs2, b:f_rs1, c:rd
+fclass_h         11100100 0000aaaa a001bbbb b1010011, a:f_rs1, b:rd
+fcvt_w_h         11000100 0000aaaa abbbcccc c1010011, a:f_rs1, b:rm, c:rd
+fcvt_wu_h        11000100 0001aaaa abbbcccc c1010011, a:f_rs1, b:rm, c:rd
+fmv_x_h          11100100 0000aaaa a000bbbb b1010011, a:f_rs1, b:rd
+fcvt_h_w         11010100 0000aaaa abbbcccc c1010011, a:rs1, b:rm, c:f_rd
+fcvt_h_wu        11010100 0001aaaa abbbcccc c1010011, a:rs1, b:rm, c:f_rd
+fmv_h_x          11110100 0000aaaa a000bbbb b1010011, a:rs1, b:f_rd
+fcvt_l_h         11000100 0010aaaa abbbcccc c1010011, a:f_rs1, b:rm, c:rd
+fcvt_lu_h        11000100 0011aaaa abbbcccc c1010011, a:f_rs1, b:rm, c:rd
+fcvt_h_l         11010100 0010aaaa abbbcccc c1010011, a:rs1, b:rm, c:f_rd
+fcvt_h_lu        11010100 0011aaaa abbbcccc c1010011, a:rs1, b:rm, c:f_rd
 
 #
 # Generic instruction types

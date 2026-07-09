@@ -1170,6 +1170,110 @@ size_t scan_riscv(dbm_thread *thread_data, uint16_t *read_address,
         case RISCV_SRAW:
           copy_riscv();
           break;
+
+        /*
+         * Bit-manipulation (Zba, Zbb, Zbc, Zbs), carry-less multiply,
+         * cache-block ops (Zicbom/Zicbop/Zicboz), integer conditional
+         * (Zicond) and half-precision floating-point (Zfh/Zfhmin).
+         *
+         * None of these are PC-relative or control-flow instructions, so
+         * they are all safe to copy verbatim into the code cache.
+         */
+        // Zba Standard Extension for Address Generation
+        case RISCV_ADD_UW:
+        case RISCV_SH1ADD:
+        case RISCV_SH1ADD_UW:
+        case RISCV_SH2ADD:
+        case RISCV_SH2ADD_UW:
+        case RISCV_SH3ADD:
+        case RISCV_SH3ADD_UW:
+        case RISCV_SLLI_UW:
+        // Zbb Standard Extension for Basic Bit-Manipulation
+        case RISCV_ANDN:
+        case RISCV_ORN:
+        case RISCV_XNOR:
+        case RISCV_CLZ:
+        case RISCV_CLZW:
+        case RISCV_CTZ:
+        case RISCV_CTZW:
+        case RISCV_CPOP:
+        case RISCV_CPOPW:
+        case RISCV_MAX:
+        case RISCV_MAXU:
+        case RISCV_MIN:
+        case RISCV_MINU:
+        case RISCV_SEXT_B:
+        case RISCV_SEXT_H:
+        case RISCV_ZEXT_H:
+        case RISCV_ROL:
+        case RISCV_ROLW:
+        case RISCV_ROR:
+        case RISCV_RORW:
+        case RISCV_RORI:
+        case RISCV_RORIW:
+        case RISCV_ORC_B:
+        case RISCV_REV8:
+        // Zbc Standard Extension for Carry-less Multiplication
+        case RISCV_CLMUL:
+        case RISCV_CLMULH:
+        case RISCV_CLMULR:
+        // Zbs Standard Extension for Single-Bit Instructions
+        case RISCV_BCLR:
+        case RISCV_BCLRI:
+        case RISCV_BEXT:
+        case RISCV_BEXTI:
+        case RISCV_BINV:
+        case RISCV_BINVI:
+        case RISCV_BSET:
+        case RISCV_BSETI:
+        // Zicbom / Zicbop / Zicboz Standard Extensions for Cache-Block Operations
+        case RISCV_CBO_CLEAN:
+        case RISCV_CBO_FLUSH:
+        case RISCV_CBO_INVAL:
+        case RISCV_CBO_ZERO:
+        case RISCV_PREFETCH_I:
+        case RISCV_PREFETCH_R:
+        case RISCV_PREFETCH_W:
+        // Zicond Standard Extension for Integer Conditional Operations
+        case RISCV_CZERO_EQZ:
+        case RISCV_CZERO_NEZ:
+        // Zfh / Zfhmin Standard Extensions for Half-Precision Floating-Point
+        case RISCV_FLH:
+        case RISCV_FSH:
+        case RISCV_FMADD_H:
+        case RISCV_FMSUB_H:
+        case RISCV_FNMSUB_H:
+        case RISCV_FNMADD_H:
+        case RISCV_FADD_H:
+        case RISCV_FSUB_H:
+        case RISCV_FMUL_H:
+        case RISCV_FDIV_H:
+        case RISCV_FSQRT_H:
+        case RISCV_FSGNJ_H:
+        case RISCV_FSGNJN_H:
+        case RISCV_FSGNJX_H:
+        case RISCV_FMIN_H:
+        case RISCV_FMAX_H:
+        case RISCV_FCVT_S_H:
+        case RISCV_FCVT_H_S:
+        case RISCV_FCVT_D_H:
+        case RISCV_FCVT_H_D:
+        case RISCV_FEQ_H:
+        case RISCV_FLT_H:
+        case RISCV_FLE_H:
+        case RISCV_FCLASS_H:
+        case RISCV_FCVT_W_H:
+        case RISCV_FCVT_WU_H:
+        case RISCV_FMV_X_H:
+        case RISCV_FCVT_H_W:
+        case RISCV_FCVT_H_WU:
+        case RISCV_FMV_H_X:
+        case RISCV_FCVT_L_H:
+        case RISCV_FCVT_LU_H:
+        case RISCV_FCVT_H_L:
+        case RISCV_FCVT_H_LU:
+          copy_riscv();
+          break;
         // RV32/RV64 Zifencei Standard Extension
 
         // RV32/RV64 "Zicsr", Control and Status Register (CSR) Instructions
@@ -1300,7 +1404,7 @@ size_t scan_riscv(dbm_thread *thread_data, uint16_t *read_address,
             stop = true;
             debug("WARN: deferred scanning because of unknown instruction at: %p\n", read_address);
           } else {
-            fprintf(stderr, "Unknown RISC-V instruction: %d at %p\n", inst, read_address);
+            fprintf(stderr, "Unknown RISC-V instruction: %x at %p\n", inst, read_address);
             while(1);
             exit(EXIT_FAILURE);
           }
