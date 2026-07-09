@@ -32,7 +32,7 @@ struct br_count {
   uint64_t return_branch_count;
 };
 
-struct br_count global_counters;
+struct br_count bc_global_counters;
 
 int branch_count_pre_thread_handler(mambo_context *ctx) {
   struct br_count *counters = mambo_alloc(ctx, sizeof(struct br_count));
@@ -44,7 +44,7 @@ int branch_count_pre_thread_handler(mambo_context *ctx) {
   counters->return_branch_count = 0;
 }
 
-void print_counters(struct br_count *counters) {
+void bc_print_counters(struct br_count *counters) {
   fprintf(stderr, "  direct branches: %'" PRIu64 "\n", counters->direct_branch_count);
   fprintf(stderr, "  indirect branches: %'" PRIu64 "\n", counters->indirect_branch_count);
   fprintf(stderr, "  returns: %'" PRIu64 "\n", counters->return_branch_count);
@@ -54,19 +54,19 @@ int branch_count_post_thread_handler(mambo_context *ctx) {
   struct br_count *counters = mambo_get_thread_plugin_data(ctx);
 
   fprintf(stderr, "Thread: %d\n", mambo_get_thread_id(ctx));
-  print_counters(counters);
-  atomic_increment_u64(&global_counters.direct_branch_count,
+  bc_print_counters(counters);
+  atomic_increment_u64(&bc_global_counters.direct_branch_count,
                        counters->direct_branch_count);
-  atomic_increment_u64(&global_counters.indirect_branch_count,
+  atomic_increment_u64(&bc_global_counters.indirect_branch_count,
                        counters->indirect_branch_count);
-  atomic_increment_u64(&global_counters.return_branch_count,
+  atomic_increment_u64(&bc_global_counters.return_branch_count,
                        counters->return_branch_count);
   mambo_free(ctx, counters);
 }
 
 int branch_count_exit_handler(mambo_context *ctx) {
   fprintf(stderr, "Total:\n");
-  print_counters(&global_counters);
+  bc_print_counters(&bc_global_counters);
 }
 
 int branch_count_pre_inst_handler(mambo_context *ctx) {

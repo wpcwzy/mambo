@@ -55,7 +55,7 @@ int instruction_count_exit_handler(mambo_context *ctx);
 void print_counters(struct instructions *counters);
 
 // Plugin registration and event callbacks function
-__attribute__((constructor)) void branch_count_init_plugin() {
+__attribute__((constructor)) void instruction_mix_init_plugin() {
   mambo_context *ctx = mambo_register_plugin();
   assert(ctx != NULL);
 
