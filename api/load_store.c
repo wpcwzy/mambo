@@ -971,6 +971,7 @@ int _riscv_calc_ld_st_addr(mambo_context *ctx, enum reg reg) {
       unsigned int uimmhi;
       unsigned int uimmlo;
       riscv_c_sw_decode_fields(inst, &rs2, &rs1, &uimmhi, &uimmlo);
+      rs1 += s0; // compressed CL/CS reg fields encode x8-x15
       unsigned int offset = __riscv_c_word_offset(uimmhi, uimmlo);
       _generate_addr(ctx, reg, rs1, reg_invalid, offset);
       break;
@@ -981,6 +982,7 @@ int _riscv_calc_ld_st_addr(mambo_context *ctx, enum reg reg) {
       unsigned int uimmhi;
       unsigned int uimmlo;
       riscv_c_lw_decode_fields(inst, &rd, &rs1, &uimmhi, &uimmlo);
+      rs1 += s0; // compressed CL/CS reg fields encode x8-x15
       unsigned int offset = __riscv_c_word_offset(uimmhi, uimmlo);
       _generate_addr(ctx, reg, rs1, reg_invalid, offset);
       break;
@@ -991,6 +993,7 @@ int _riscv_calc_ld_st_addr(mambo_context *ctx, enum reg reg) {
       unsigned int uimmhi;
       unsigned int uimmlo;
       riscv_c_fsd_decode_fields(inst, &rs2, &rs1, &uimmhi, &uimmlo);
+      rs1 += s0; // compressed CL/CS reg fields encode x8-x15
       unsigned int offset = __riscv_c_doubleword_offset(uimmhi, uimmlo);
       _generate_addr(ctx, reg, rs1, reg_invalid, offset);
       break;
@@ -1001,6 +1004,7 @@ int _riscv_calc_ld_st_addr(mambo_context *ctx, enum reg reg) {
       unsigned int uimmhi;
       unsigned int uimmlo;
       riscv_c_fld_decode_fields(inst, &rd, &rs1, &uimmhi, &uimmlo);
+      rs1 += s0; // compressed CL/CS reg fields encode x8-x15
       unsigned int offset = __riscv_c_doubleword_offset(uimmhi, uimmlo);
       _generate_addr(ctx, reg, rs1, reg_invalid, offset);
       break;
@@ -1012,6 +1016,7 @@ int _riscv_calc_ld_st_addr(mambo_context *ctx, enum reg reg) {
       unsigned int uimmhi;
       unsigned int uimmlo;
       riscv_c_sd_decode_fields(inst, &rs2, &rs1, &uimmhi, &uimmlo);
+      rs1 += s0; // compressed CL/CS reg fields encode x8-x15
       unsigned int offset = __riscv_c_doubleword_offset(uimmhi, uimmlo);
       _generate_addr(ctx, reg, rs1, reg_invalid, offset);
       break;
@@ -1022,6 +1027,7 @@ int _riscv_calc_ld_st_addr(mambo_context *ctx, enum reg reg) {
       unsigned int uimmhi;
       unsigned int uimmlo;
       riscv_c_ld_decode_fields(inst, &rd, &rs1, &uimmhi, &uimmlo);
+      rs1 += s0; // compressed CL/CS reg fields encode x8-x15
       unsigned int offset = __riscv_c_doubleword_offset(uimmhi, uimmlo);
       _generate_addr(ctx, reg, rs1, reg_invalid, offset);
       break;
