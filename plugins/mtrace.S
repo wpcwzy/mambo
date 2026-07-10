@@ -19,6 +19,8 @@
 
 #include "mtrace.h"
 
+#if defined(__arm__) || defined(__aarch64__)
+
 #ifdef __arm__
 .syntax unified
 #endif
@@ -105,3 +107,113 @@ call:
 #endif
 
 .endfunc
+#endif
+
+#if defined(__riscv) && __riscv_xlen == 64
+
+.global mtrace_buf_write
+.func
+.type mtrace_buf_write, %function
+
+mtrace_buf_write:
+  addi sp, sp, -16
+  sd t0, 0(sp)
+  sd t1, 8(sp)
+
+  lwu t0, -8(a2)
+  slli t1, t0, 4
+  add t1, a2, t1
+  sd a0, 0(t1)
+  sd a1, 8(t1)
+
+  addiw t0, t0, 1
+  sw t0, -8(a2)
+
+  li t1, BUFLEN
+  beq t0, t1, call
+
+  ld t0, 0(sp)
+  ld t1, 8(sp)
+  addi sp, sp, 16
+  ret
+
+call:
+  addi sp, sp, -16
+  sd ra, 0(sp)
+  sd s0, 8(sp)
+
+  // Save caller-saved GP registers (a3-a7, t0-t6)
+  addi sp, sp, -(12 * 8)
+  sd a3,  0 * 8(sp)
+  sd a4,  1 * 8(sp)
+  sd a5,  2 * 8(sp)
+  sd a6,  3 * 8(sp)
+  sd a7,  4 * 8(sp)
+  sd t0,  5 * 8(sp)
+  sd t1,  6 * 8(sp)
+  sd t2,  7 * 8(sp)
+  sd t3,  8 * 8(sp)
+  sd t4,  9 * 8(sp)
+  sd t5, 10 * 8(sp)
+  sd t6, 11 * 8(sp)
+
+  // Save s1, s2 for FP status storage
+  addi sp, sp, -16
+  sd s1, 0(sp)
+  sd s2, 8(sp)
+
+  // Save FP registers (only if FP is available)
+#if __riscv_flen
+  jal ra, push_fp
+#endif
+
+  // Save FP status registers
+  frcsr s0
+  frflags s1
+  frrm s2
+
+  // Call mtrace_print_buf(&trace->len)
+  addi a0, a2, -8
+  la a1, mtrace_print_buf
+  jalr ra, a1
+
+  // Restore FP status registers
+  fscsr s0
+  fsflags s1
+  fsrm s2
+
+  // Restore FP registers
+#if __riscv_flen
+  jal ra, pop_fp
+#endif
+
+  // Restore s1, s2
+  ld s1, 0(sp)
+  ld s2, 8(sp)
+  addi sp, sp, 16
+
+  // Restore caller-saved GP registers
+  ld a3,  0 * 8(sp)
+  ld a4,  1 * 8(sp)
+  ld a5,  2 * 8(sp)
+  ld a6,  3 * 8(sp)
+  ld a7,  4 * 8(sp)
+  ld t0,  5 * 8(sp)
+  ld t1,  6 * 8(sp)
+  ld t2,  7 * 8(sp)
+  ld t3,  8 * 8(sp)
+  ld t4,  9 * 8(sp)
+  ld t5, 10 * 8(sp)
+  ld t6, 11 * 8(sp)
+  addi sp, sp, (12 * 8)
+
+  // Restore ra, s0 and original t0, t1 from fast-path frame
+  ld ra, 0(sp)
+  ld s0, 8(sp)
+  ld t0, 16(sp)
+  ld t1, 24(sp)
+  addi sp, sp, 32
+  ret
+
+.endfunc
+#endif

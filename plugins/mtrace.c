@@ -36,7 +36,7 @@ struct mtrace {
   struct mtrace_entry entries[BUFLEN];
 };
 
-extern void mtrace_print_buf_trampoline(struct mtrace *trace);
+// extern void mtrace_print_buf_trampoline(struct mtrace *trace);
 extern void mtrace_buf_write(uintptr_t value, struct mtrace *trace);
 
 void mtrace_print_buf(struct mtrace *mtrace_buf) {
