@@ -161,25 +161,46 @@ void cachesim_proc_buf(cachesim_trace_t *trace_buf) {
 }
 
 void inst_code(mambo_context *ctx, cachesim_thread_t *cachesim_thread) {
+#ifdef __riscv
+  emit_push(ctx, (1 << a0) | (1 << a1) | (1 << a2) | (1 << lr));
+#else
   emit_push(ctx, (1 << 0) | (1 << 1) | (1 << 2) | (1 << lr));
+#endif
 
   void *addr = mambo_get_source_addr(ctx);
   assert(addr != NULL);
+#ifdef __riscv
+  emit_set_reg_ptr(ctx, a0, addr);
+
+  cachesim_thread->set_inst_size = mambo_get_cc_addr(ctx);
+  emit_set_reg(ctx, a1, 0);
+
+  emit_set_reg_ptr(ctx, a2, &cachesim_thread->inst_trace_buf.entries);
+#else
   emit_set_reg_ptr(ctx, 0, addr);
 
   cachesim_thread->set_inst_size = mambo_get_cc_addr(ctx);
   emit_set_reg(ctx, 1, 0);
 
   emit_set_reg_ptr(ctx, 2, &cachesim_thread->inst_trace_buf.entries);
+#endif
   emit_fcall(ctx, cachesim_buf_write);
 
+#ifdef __riscv
+  emit_pop(ctx, (1 << a0) | (1 << a1) | (1 << a2) | (1 << lr));
+#else
   emit_pop(ctx, (1 << 0) | (1 << 1) | (1 << 2) | (1 << lr));
+#endif
 }
 
 void set_inst_size(mambo_context *ctx, cachesim_thread_t *cachesim_thread ) {
   void *tmp = mambo_get_cc_addr(ctx);
   mambo_set_cc_addr(ctx, cachesim_thread->set_inst_size);
+#ifdef __riscv
+  emit_set_reg(ctx, a1, cachesim_thread->fragment_size << 1);
+#else
   emit_set_reg(ctx, 1, cachesim_thread->fragment_size << 1);
+#endif
   mambo_set_cc_addr(ctx, tmp);
 }
 
@@ -197,19 +218,36 @@ int cachesim_pre_inst_handler(mambo_context *ctx) {
       assert(ret == 0);
     }
 
-    emit_push(ctx, (1 << 0) | (1 << 1) | (1 << 2) | (1 << lr));    
+#ifdef __riscv
+    emit_push(ctx, (1 << a0) | (1 << a1) | (1 << a2) | (1 << lr));
+#else
+    emit_push(ctx, (1 << 0) | (1 << 1) | (1 << 2) | (1 << lr));
+#endif
 
+#ifdef __riscv
+    ret = mambo_calc_ld_st_addr(ctx, a0);
+#else
     ret = mambo_calc_ld_st_addr(ctx, 0);
+#endif
     assert(ret == 0);
     int size = mambo_get_ld_st_size(ctx);
     assert(size > 0);
 
     uintptr_t info = (size << 1) | (is_store ? 1 : 0);
+#ifdef __riscv
+    emit_set_reg(ctx, a1, info);
+    emit_set_reg_ptr(ctx, a2, &cachesim_thread->data_trace_buf.entries);
+#else
     emit_set_reg(ctx, 1, info);
     emit_set_reg_ptr(ctx, 2, &cachesim_thread->data_trace_buf.entries);
+#endif
     emit_fcall(ctx, cachesim_buf_write);
 
+#ifdef __riscv
+    emit_pop(ctx, (1 << a0) | (1 << a1) | (1 << a2) | (1 << lr));
+#else
     emit_pop(ctx, (1 << 0) | (1 << 1) | (1 << 2) | (1 << lr));
+#endif
 
     if (cond != AL) {
       ret = emit_local_branch_cond(ctx, &skip_br, invert_cond(cond));

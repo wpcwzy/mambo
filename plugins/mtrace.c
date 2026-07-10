@@ -64,19 +64,36 @@ int mtrace_pre_inst_handler(mambo_context *ctx) {
       assert(ret == 0);
     }
 
-    emit_push(ctx, (1 << 0) | (1 << 1) | (1 << 2) | (1 << lr));    
+#ifdef __riscv
+    emit_push(ctx, (1 << a0) | (1 << a1) | (1 << a2) | (1 << lr));
+#else
+    emit_push(ctx, (1 << 0) | (1 << 1) | (1 << 2) | (1 << lr));
+#endif
 
+#ifdef __riscv
+    ret = mambo_calc_ld_st_addr(ctx, a0);
+#else
     ret = mambo_calc_ld_st_addr(ctx, 0);
+#endif
     assert(ret == 0);
     int size = mambo_get_ld_st_size(ctx);
     assert(size > 0);
 
     uintptr_t info = (size << 1) | (is_store ? 1 : 0);
+#ifdef __riscv
+    emit_set_reg(ctx, a1, info);
+    emit_set_reg_ptr(ctx, a2, &mtrace_buf->entries);
+#else
     emit_set_reg(ctx, 1, info);
     emit_set_reg_ptr(ctx, 2, &mtrace_buf->entries);
+#endif
     emit_fcall(ctx, mtrace_buf_write);
 
+#ifdef __riscv
+    emit_pop(ctx, (1 << a0) | (1 << a1) | (1 << a2) | (1 << lr));
+#else
     emit_pop(ctx, (1 << 0) | (1 << 1) | (1 << 2) | (1 << lr));
+#endif
 
     if (cond != AL) {
       ret = emit_local_branch_cond(ctx, &skip_br, invert_cond(cond));
