@@ -19,13 +19,13 @@ endif
 .PHONY: native print_arch all pie clean
 
 native: print_arch $(NATIVE_TARGETS)
-	
+
 print_arch:
 	$(info PIE: detected architecture "$(C_ARCH)")
 
 all: thumb arm a64 riscv
 
-%:
+arm thumb a64 riscv:
 	$(MAKE) --no-print-directory ARCH=$@ pie
 
 pie: pie-$(ARCH)-decoder.o pie-$(ARCH)-encoder.o pie-$(ARCH)-field-decoder.o
