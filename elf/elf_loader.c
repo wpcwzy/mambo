@@ -356,6 +356,7 @@ void elf_run(uintptr_t entry_address, char *filename, int argc, char **argv, cha
       case AT_PAGESZ:
       case AT_HWCAP:
       case AT_HWCAP2:
+      case AT_HWCAP3:
       case AT_CLKTCK:
       case AT_FLAGS:
       case AT_UID:
