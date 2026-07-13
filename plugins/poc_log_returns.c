@@ -32,6 +32,7 @@ void log_returns_print(void *return_from, void *return_to) {
 /* Proof of concept. Note that only a subset of returns are currently instrumented by this code */
 int log_returns_pre_inst(mambo_context *ctx) {
   bool instrument = false;
+  intptr_t return_offset = 0;
   int inst = mambo_get_inst(ctx);
 #ifdef __arm__
   inst_set isa = mambo_get_inst_type(ctx);
@@ -54,6 +55,7 @@ int log_returns_pre_inst(mambo_context *ctx) {
     riscv_jalr_decode_fields(mambo_get_source_addr(ctx), &rd, &rs1, &imm);
     if (rd == x0 && rs1 == x1) {
       instrument = true;
+      return_offset = sign_extend(12, imm);
     }
   } else if (inst == RISCV_C_JR) {
     unsigned int rs1;
@@ -68,7 +70,7 @@ int log_returns_pre_inst(mambo_context *ctx) {
   if (instrument) {
     emit_push(ctx, (1 << reg0) | (1 << reg1));
     emit_set_reg_ptr(ctx, reg0, mambo_get_source_addr(ctx));
-    emit_mov(ctx, reg1, lr);
+    emit_add_sub_i(ctx, reg1, lr, return_offset);
     emit_safe_fcall(ctx, log_returns_print, 2);
     emit_pop(ctx, (1 << reg0) | (1 << reg1));
   }
