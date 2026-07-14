@@ -33,6 +33,14 @@ start_of_dispatcher_s:
    #error "Risc-V 128-bit no implemented"
 #endif
 
+#ifdef __riscv_vector
+  #define PUSH_VECTOR jal ra, push_v
+  #define POP_VECTOR  jal ra, pop_v
+#else
+  #define PUSH_VECTOR
+  #define POP_VECTOR
+#endif
+
 push_caller_saved_registers:
   addi    sp, sp, -(12 * GP_REG_SIZE)
   STR     a3,  0 * GP_REG_SIZE(sp)
@@ -153,6 +161,178 @@ pop_fp:
   ret
 #endif
 
+#ifdef __riscv_vector
+#define V_CSR_FRAME_SZ (4 * GP_REG_SIZE)
+
+.global push_v
+push_v:
+  csrr    t0, vl
+  csrr    t1, vtype
+  csrr    t2, vcsr
+  csrr    t3, vstart
+
+  addi    sp, sp, -V_CSR_FRAME_SZ
+  STR     t0, 0 * GP_REG_SIZE(sp)
+  STR     t1, 1 * GP_REG_SIZE(sp)
+  STR     t2, 2 * GP_REG_SIZE(sp)
+  STR     t3, 3 * GP_REG_SIZE(sp)
+
+  csrr    t0, vlenb
+  vsetvli zero, t0, e8, m1, ta, ma
+  csrw    vstart, zero
+  slli    t2, t0, 5
+  sub     sp, sp, t2
+  mv      t1, sp
+
+  vse8.v  v0,  (t1)
+  add     t1, t1, t0
+  vse8.v  v1,  (t1)
+  add     t1, t1, t0
+  vse8.v  v2,  (t1)
+  add     t1, t1, t0
+  vse8.v  v3,  (t1)
+  add     t1, t1, t0
+  vse8.v  v4,  (t1)
+  add     t1, t1, t0
+  vse8.v  v5,  (t1)
+  add     t1, t1, t0
+  vse8.v  v6,  (t1)
+  add     t1, t1, t0
+  vse8.v  v7,  (t1)
+  add     t1, t1, t0
+  vse8.v  v8,  (t1)
+  add     t1, t1, t0
+  vse8.v  v9,  (t1)
+  add     t1, t1, t0
+  vse8.v  v10, (t1)
+  add     t1, t1, t0
+  vse8.v  v11, (t1)
+  add     t1, t1, t0
+  vse8.v  v12, (t1)
+  add     t1, t1, t0
+  vse8.v  v13, (t1)
+  add     t1, t1, t0
+  vse8.v  v14, (t1)
+  add     t1, t1, t0
+  vse8.v  v15, (t1)
+  add     t1, t1, t0
+  vse8.v  v16, (t1)
+  add     t1, t1, t0
+  vse8.v  v17, (t1)
+  add     t1, t1, t0
+  vse8.v  v18, (t1)
+  add     t1, t1, t0
+  vse8.v  v19, (t1)
+  add     t1, t1, t0
+  vse8.v  v20, (t1)
+  add     t1, t1, t0
+  vse8.v  v21, (t1)
+  add     t1, t1, t0
+  vse8.v  v22, (t1)
+  add     t1, t1, t0
+  vse8.v  v23, (t1)
+  add     t1, t1, t0
+  vse8.v  v24, (t1)
+  add     t1, t1, t0
+  vse8.v  v25, (t1)
+  add     t1, t1, t0
+  vse8.v  v26, (t1)
+  add     t1, t1, t0
+  vse8.v  v27, (t1)
+  add     t1, t1, t0
+  vse8.v  v28, (t1)
+  add     t1, t1, t0
+  vse8.v  v29, (t1)
+  add     t1, t1, t0
+  vse8.v  v30, (t1)
+  add     t1, t1, t0
+  vse8.v  v31, (t1)
+  ret
+
+.global pop_v
+pop_v:
+  csrr    t0, vlenb
+  vsetvli zero, t0, e8, m1, ta, ma
+  csrw    vstart, zero
+  mv      t1, sp
+
+  vle8.v  v0,  (t1)
+  add     t1, t1, t0
+  vle8.v  v1,  (t1)
+  add     t1, t1, t0
+  vle8.v  v2,  (t1)
+  add     t1, t1, t0
+  vle8.v  v3,  (t1)
+  add     t1, t1, t0
+  vle8.v  v4,  (t1)
+  add     t1, t1, t0
+  vle8.v  v5,  (t1)
+  add     t1, t1, t0
+  vle8.v  v6,  (t1)
+  add     t1, t1, t0
+  vle8.v  v7,  (t1)
+  add     t1, t1, t0
+  vle8.v  v8,  (t1)
+  add     t1, t1, t0
+  vle8.v  v9,  (t1)
+  add     t1, t1, t0
+  vle8.v  v10, (t1)
+  add     t1, t1, t0
+  vle8.v  v11, (t1)
+  add     t1, t1, t0
+  vle8.v  v12, (t1)
+  add     t1, t1, t0
+  vle8.v  v13, (t1)
+  add     t1, t1, t0
+  vle8.v  v14, (t1)
+  add     t1, t1, t0
+  vle8.v  v15, (t1)
+  add     t1, t1, t0
+  vle8.v  v16, (t1)
+  add     t1, t1, t0
+  vle8.v  v17, (t1)
+  add     t1, t1, t0
+  vle8.v  v18, (t1)
+  add     t1, t1, t0
+  vle8.v  v19, (t1)
+  add     t1, t1, t0
+  vle8.v  v20, (t1)
+  add     t1, t1, t0
+  vle8.v  v21, (t1)
+  add     t1, t1, t0
+  vle8.v  v22, (t1)
+  add     t1, t1, t0
+  vle8.v  v23, (t1)
+  add     t1, t1, t0
+  vle8.v  v24, (t1)
+  add     t1, t1, t0
+  vle8.v  v25, (t1)
+  add     t1, t1, t0
+  vle8.v  v26, (t1)
+  add     t1, t1, t0
+  vle8.v  v27, (t1)
+  add     t1, t1, t0
+  vle8.v  v28, (t1)
+  add     t1, t1, t0
+  vle8.v  v29, (t1)
+  add     t1, t1, t0
+  vle8.v  v30, (t1)
+  add     t1, t1, t0
+  vle8.v  v31, (t1)
+
+  slli    t2, t0, 5
+  add     sp, sp, t2
+  LDR     t0, 0 * GP_REG_SIZE(sp)
+  LDR     t1, 1 * GP_REG_SIZE(sp)
+  LDR     t2, 2 * GP_REG_SIZE(sp)
+  LDR     t3, 3 * GP_REG_SIZE(sp)
+  vsetvl  zero, t0, t1
+  csrw    vcsr, t2
+  csrw    vstart, t3
+  addi    sp, sp, V_CSR_FRAME_SZ
+  ret
+#endif
+
 
 .global dispatcher_trampoline
 dispatcher_trampoline:
@@ -190,6 +370,7 @@ dispatcher_trampoline:
 
   jal     ra,  push_caller_saved_registers
   jal     ra,  push_fp
+  PUSH_VECTOR
 
   // Save the status registers
   frcsr s0
@@ -223,6 +404,7 @@ dispatcher_trampoline:
   fsflags s1
   fsrm s2
 
+  POP_VECTOR
   jal     ra, pop_fp
   jal     ra, pop_caller_saved_registers
 
@@ -299,6 +481,7 @@ create_trace_trampoline:
 
   jal     ra, push_caller_saved_registers
   jal     ra, push_fp
+  PUSH_VECTOR
 
   addi    sp, sp, -3 * GP_REG_SIZE
   STR     s0, 0 * GP_REG_SIZE(sp)
@@ -326,6 +509,7 @@ create_trace_trampoline:
   LDR     s2, 2 * GP_REG_SIZE(sp)
   addi    sp, sp, (3 * GP_REG_SIZE)
 
+  POP_VECTOR
   jal     ra, pop_fp
   jal     ra, pop_caller_saved_registers
 
@@ -455,8 +639,10 @@ syscall_wrapper:
 
   // Spill the floating point registers
   jal     ra,  push_fp
+  PUSH_VECTOR
 
   jalr a4
+  POP_VECTOR
   beqz a0, skip_syscall // if ret == 0, MAMBO has emulated the syscall and we can return directly
 
   // load the syscall arguments
@@ -484,7 +670,9 @@ syscall_wrapper:
   lla a4, syscall_handler_post_addr
   ld  a4, (a4)
 
+  PUSH_VECTOR
   jalr a4
+  POP_VECTOR
 
 skip_syscall:
   jal     ra,  pop_fp

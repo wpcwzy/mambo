@@ -494,6 +494,9 @@ safe_fcall_trampoline:
 #if __riscv_flen
   jal ra, push_fp
 #endif
+#ifdef __riscv_vector
+  jal ra, push_v
+#endif
 
   frcsr s0
   frflags s1
@@ -506,7 +509,14 @@ safe_fcall_trampoline:
   fsrm s2
 
 #if __riscv_flen
+#ifdef __riscv_vector
+  jal ra, pop_v
+#endif
   jal ra, pop_fp
+#else
+#ifdef __riscv_vector
+  jal ra, pop_v
+#endif
 #endif
 
 #if __riscv_xlen == 32

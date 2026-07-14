@@ -116,7 +116,11 @@ void _riscv_is_load_or_store(mambo_context *ctx, bool *is_load, bool *is_store) 
     case RISCV_SC_W:
     case RISCV_SC_D:
     case RISCV_FSW:
-    case RISCV_FSD: {
+    case RISCV_FSD:
+    case RISCV_V_STORE_B:
+    case RISCV_V_STORE_H:
+    case RISCV_V_STORE_W:
+    case RISCV_V_STORE_D: {
       *is_store = true;
       break;
     }
@@ -138,7 +142,11 @@ void _riscv_is_load_or_store(mambo_context *ctx, bool *is_load, bool *is_store) 
     case RISCV_FLD:
     case RISCV_LBU:
     case RISCV_LHU:
-    case RISCV_LWU: {
+    case RISCV_LWU:
+    case RISCV_V_LOAD_B:
+    case RISCV_V_LOAD_H:
+    case RISCV_V_LOAD_W:
+    case RISCV_V_LOAD_D: {
       *is_load = true;
       break;
     }
@@ -160,7 +168,11 @@ void _riscv_is_load_or_store(mambo_context *ctx, bool *is_load, bool *is_store) 
     case RISCV_AMOMIN_D:
     case RISCV_AMOMAX_D:
     case RISCV_AMOMINU_D:
-    case RISCV_AMOMAXU_D: {
+    case RISCV_AMOMAXU_D:
+    case RISCV_V_AMO_B:
+    case RISCV_V_AMO_H:
+    case RISCV_V_AMO_W:
+    case RISCV_V_AMO_D: {
       *is_load = true;
       *is_store = true;
       break;
