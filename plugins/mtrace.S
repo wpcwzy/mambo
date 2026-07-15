@@ -166,6 +166,9 @@ call:
 #if __riscv_flen
   jal ra, push_fp
 #endif
+#ifdef __riscv_vector
+  jal ra, push_v
+#endif
 
   // Save FP status registers
   frcsr s0
@@ -184,7 +187,14 @@ call:
 
   // Restore FP registers
 #if __riscv_flen
+#ifdef __riscv_vector
+  jal ra, pop_v
+#endif
   jal ra, pop_fp
+#else
+#ifdef __riscv_vector
+  jal ra, pop_v
+#endif
 #endif
 
   // Restore s1, s2

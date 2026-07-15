@@ -1272,6 +1272,21 @@ size_t scan_riscv(dbm_thread *thread_data, uint16_t *read_address,
         case RISCV_FCVT_LU_H:
         case RISCV_FCVT_H_L:
         case RISCV_FCVT_H_LU:
+        // RVV vector instructions. They are not PC-relative and do not alter
+        // scalar control flow, so the code cache can execute them verbatim.
+        case RISCV_V_OP:
+        case RISCV_V_LOAD_B:
+        case RISCV_V_LOAD_H:
+        case RISCV_V_LOAD_W:
+        case RISCV_V_LOAD_D:
+        case RISCV_V_STORE_B:
+        case RISCV_V_STORE_H:
+        case RISCV_V_STORE_W:
+        case RISCV_V_STORE_D:
+        case RISCV_V_AMO_B:
+        case RISCV_V_AMO_H:
+        case RISCV_V_AMO_W:
+        case RISCV_V_AMO_D:
           copy_riscv();
           break;
         // RV32/RV64 Zifencei Standard Extension
