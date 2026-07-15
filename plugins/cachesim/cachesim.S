@@ -105,3 +105,118 @@ call:
 #endif
 
 .endfunc
+
+#if defined(__riscv) && __riscv_xlen == 64
+
+/*
+ * a0 = referenced address
+ * a1 = (access_size << 1) | is_write
+ * a2 = &trace->entries[0]
+ *
+ * The cachesim_trace_t layout places len eight bytes before entries[0] on
+ * RV64: a four-byte len followed by four bytes of alignment padding.
+ */
+.global cachesim_buf_write
+.func
+.type cachesim_buf_write, %function
+
+cachesim_buf_write:
+  /* Fast path: append one 16-byte trace entry. */
+  addi sp, sp, -16
+  sd t0, 0(sp)
+  sd t1, 8(sp)
+
+  lwu t0, -8(a2)             // trace->len
+  slli t1, t0, 4             // len * sizeof(cachesim_trace_entry_t)
+  add t1, a2, t1
+  sd a0, 0(t1)               // entries[len].addr
+  sd a1, 8(t1)               // entries[len].info
+
+  addiw t0, t0, 1
+  sw t0, -8(a2)              // trace->len = len + 1
+
+  li t1, BUFLEN
+  beq t0, t1, cachesim_call
+
+  ld t0, 0(sp)
+  ld t1, 8(sp)
+  addi sp, sp, 16
+  ret
+
+cachesim_call:
+  /*
+   * The original application did not make this call, so preserve every
+   * caller-saved register not already protected by the generated wrapper
+   * (a0-a2 and ra), plus floating-point state before calling C code.
+   */
+  addi sp, sp, -16
+  sd ra, 0(sp)
+  sd s0, 8(sp)
+
+  addi sp, sp, -(12 * 8)
+  sd a3,  0 * 8(sp)
+  sd a4,  1 * 8(sp)
+  sd a5,  2 * 8(sp)
+  sd a6,  3 * 8(sp)
+  sd a7,  4 * 8(sp)
+  sd t0,  5 * 8(sp)
+  sd t1,  6 * 8(sp)
+  sd t2,  7 * 8(sp)
+  sd t3,  8 * 8(sp)
+  sd t4,  9 * 8(sp)
+  sd t5, 10 * 8(sp)
+  sd t6, 11 * 8(sp)
+
+  addi sp, sp, -16
+  sd s1, 0(sp)
+  sd s2, 8(sp)
+
+#if __riscv_flen
+  jal ra, push_fp
+#endif
+
+  frcsr s0
+  frflags s1
+  frrm s2
+
+  /* cachesim_proc_buf((cachesim_trace_t *)(a2 - 8)); */
+  addi a0, a2, -8
+  la a1, cachesim_proc_buf
+  jalr ra, a1
+
+  fscsr s0
+  fsflags s1
+  fsrm s2
+
+#if __riscv_flen
+  jal ra, pop_fp
+#endif
+
+  ld s1, 0(sp)
+  ld s2, 8(sp)
+  addi sp, sp, 16
+
+  ld a3,  0 * 8(sp)
+  ld a4,  1 * 8(sp)
+  ld a5,  2 * 8(sp)
+  ld a6,  3 * 8(sp)
+  ld a7,  4 * 8(sp)
+  ld t0,  5 * 8(sp)
+  ld t1,  6 * 8(sp)
+  ld t2,  7 * 8(sp)
+  ld t3,  8 * 8(sp)
+  ld t4,  9 * 8(sp)
+  ld t5, 10 * 8(sp)
+  ld t6, 11 * 8(sp)
+  addi sp, sp, (12 * 8)
+
+  /* Restore ra/s0 and the t0/t1 values saved by the fast path. */
+  ld ra, 0(sp)
+  ld s0, 8(sp)
+  ld t0, 16(sp)
+  ld t1, 24(sp)
+  addi sp, sp, 32
+  ret
+
+.endfunc
+#endif
