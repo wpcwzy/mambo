@@ -46,6 +46,29 @@
 #define copy_riscv()            *(uint32_t *)(write_p) = *(uint32_t *)read_address; \
                                  write_p += 2;
 
+/*
+ * The generated decoder currently has no RVV entries.  RVV instructions are
+ * fixed-width (32 bits), are not PC-relative control flow, and can therefore
+ * be copied unchanged to the code cache.  This deliberately provides a
+ * generic RVV class rather than attempting to decode every V instruction.
+ *
+ * The vector major opcodes below are distinguished from scalar FP/AMO memory
+ * instructions by their vector EEW funct3 encodings (0, 5, 6, or 7).
+ */
+static inline bool riscv_is_vector_instruction(const uint16_t *address) {
+  /* RVV instructions are 32-bit.  Avoid reading a second halfword when an
+   * unrelated malformed/compressed 16-bit encoding reaches this fallback. */
+  if ((address[0] & 0x3) != 0x3) return false;
+  const uint32_t word = (uint32_t)address[0] | ((uint32_t)address[1] << 16);
+  const uint32_t opcode = word & 0x7f;
+  const uint32_t funct3 = (word >> 12) & 0x7;
+
+  if (opcode == 0x57) return true; /* OP-V, including vset{,i}vli */
+  if ((opcode == 0x07 || opcode == 0x27 || opcode == 0x2f) &&
+      (funct3 == 0 || funct3 >= 5)) return true; /* vector memory */
+  return false;
+}
+
 #include "pie/pie-riscv-decoder.h"
 #include "pie/pie-riscv-encoder.h"
 #include "pie/pie-riscv-field-decoder.h"
@@ -867,7 +890,11 @@ void pass1_riscv(uint16_t *read_address, branch_type *bb_type) {
   *bb_type = unknown;
 
   while(*bb_type == unknown) {
-    riscv_instruction instruction = riscv_decode(read_address);
+    /* Check RVV before the legacy scalar decoder: some V encodings overlap
+     * with patterns that the old generated decoder otherwise maps to a scalar
+     * enum instead of RISCV_INVALID. */
+    riscv_instruction instruction = riscv_is_vector_instruction(read_address)
+                                  ? RISCV_VECTOR : riscv_decode(read_address);
 
     switch(instruction) {
       case RISCV_C_JAL:
@@ -956,7 +983,9 @@ size_t scan_riscv(dbm_thread *thread_data, uint16_t *read_address,
 
   while (!stop) {
     debug("Risc-V scan read_address: %p, w: : %p, bb: %d\n", read_address, write_p, basic_block);
-    riscv_instruction const inst = riscv_decode(read_address);
+    /* See the corresponding pass1_riscv() comment above. */
+    riscv_instruction inst = riscv_is_vector_instruction(read_address)
+                           ? RISCV_VECTOR : riscv_decode(read_address);
     debug("  instruction enum: %d\n", (inst == RISCV_INVALID) ? -1 : inst);
     debug("  instruction word: 0x%x\n", *read_address);
 
@@ -1127,6 +1156,7 @@ size_t scan_riscv(dbm_thread *thread_data, uint16_t *read_address,
           break;
 
         // Instructions which are safe to copy unmodified
+        case RISCV_VECTOR:  // Generic RVV instruction; classification is in instruction_mix.
         case RISCV_LUI:     // Load Upper Immediate
         case RISCV_LB:
         case RISCV_LH:
@@ -1272,21 +1302,6 @@ size_t scan_riscv(dbm_thread *thread_data, uint16_t *read_address,
         case RISCV_FCVT_LU_H:
         case RISCV_FCVT_H_L:
         case RISCV_FCVT_H_LU:
-        // RVV vector instructions. They are not PC-relative and do not alter
-        // scalar control flow, so the code cache can execute them verbatim.
-        case RISCV_V_OP:
-        case RISCV_V_LOAD_B:
-        case RISCV_V_LOAD_H:
-        case RISCV_V_LOAD_W:
-        case RISCV_V_LOAD_D:
-        case RISCV_V_STORE_B:
-        case RISCV_V_STORE_H:
-        case RISCV_V_STORE_W:
-        case RISCV_V_STORE_D:
-        case RISCV_V_AMO_B:
-        case RISCV_V_AMO_H:
-        case RISCV_V_AMO_W:
-        case RISCV_V_AMO_D:
           copy_riscv();
           break;
         // RV32/RV64 Zifencei Standard Extension
