@@ -732,6 +732,27 @@ void riscv_cond_branch(dbm_thread *thread_data, uint16_t *read_address,
     write_p += 2;
   }
 
+  if (rs1 == sp || rs2 == sp) {
+    uint16_t *rv_cond_branch = write_p;
+    write_p += 2;
+
+    riscv_save_context(&write_p);
+    riscv_copy_to_reg(&write_p, a1, basic_block);
+    riscv_copy_to_reg(&write_p, a0, fallthrough_addr);
+    riscv_go_to_dispatcher(thread_data, &write_p);
+
+    uintptr_t skip_addr = (uintptr_t)write_p;
+    riscv_save_context(&write_p);
+    riscv_copy_to_reg(&write_p, a1, basic_block);
+    riscv_copy_to_reg(&write_p, a0, target);
+    riscv_go_to_dispatcher(thread_data, &write_p);
+
+    riscv_branch_helper(&rv_cond_branch, skip_addr, rs1, rs2, cond);
+
+    *o_write_p = write_p;
+    return;
+  }
+
   riscv_save_context(&write_p);
   if (rs1 != a1 && rs2 != a1) {
     riscv_copy_to_reg(&write_p, a1, basic_block);
@@ -852,7 +873,7 @@ bool riscv_scanner_deliver_callbacks(dbm_thread *thread_data, mambo_cb_idx cb_id
   return replaced;
 }
 
-inline void next_instruction(riscv_instruction instruction,
+static inline void next_instruction(riscv_instruction instruction,
                              uint16_t **o_read_address) {
   uint16_t *read_address = *o_read_address;
   if (instruction < RISCV_LUI)

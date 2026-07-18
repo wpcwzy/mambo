@@ -65,12 +65,41 @@
 #define syscall_wrapper_offset        ((uintptr_t)syscall_wrapper - (uintptr_t)&start_of_dispatcher_s)
 #define trace_head_incr_offset        ((uintptr_t)trace_head_incr - (uintptr_t)&start_of_dispatcher_s)
 
+#ifndef MAP_FIXED_NOREPLACE
+#define MAP_FIXED_NOREPLACE 0x100000
+#endif
+
+#define MAMBO_INTERNAL_MAP_BASE ((uintptr_t)0x50000000)
+
 uintptr_t page_size;
 dbm_global global_data;
 __thread dbm_thread *current_thread;
 #ifdef __riscv
 uintptr_t mambo_gp;
 #endif
+
+static pthread_mutex_t internal_map_mutex = PTHREAD_MUTEX_INITIALIZER;
+static uintptr_t internal_map_next = MAMBO_INTERNAL_MAP_BASE;
+
+static void *mambo_internal_mmap(size_t size, int prot, int flags, size_t alignment) {
+  int ret = pthread_mutex_lock(&internal_map_mutex);
+  assert(ret == 0);
+
+  uintptr_t hint = align_higher(internal_map_next, alignment);
+  size_t map_size = ROUND_UP(size, alignment);
+  void *map = mmap((void *)hint, map_size, prot, flags | MAP_FIXED_NOREPLACE, -1, 0);
+
+  if (map != MAP_FAILED) {
+    internal_map_next = hint + map_size;
+  } else {
+    map = mmap(NULL, size, prot, flags, -1, 0);
+  }
+
+  ret = pthread_mutex_unlock(&internal_map_mutex);
+  assert(ret == 0);
+
+  return map;
+}
 
 void flush_code_cache(dbm_thread *thread_data) {
   thread_data->was_flushed = true;
@@ -338,7 +367,7 @@ int unregister_thread(dbm_thread *thread_data, bool caller_has_lock) {
 }
 
 void dbm_exit(dbm_thread *thread_data, uint32_t code) {
-  fprintf(stderr, "We're done; exiting with status: %d\n", code);
+  info("We're done; exiting with status: %d\n", code);
 
 #ifdef PLUGINS_NEW
   lock_thread_list();
@@ -380,7 +409,8 @@ void thread_abort(dbm_thread *thread_data) {
 }
 
 bool allocate_thread_data(dbm_thread **thread_data) {
-  dbm_thread *data = mmap(NULL, sizeof(dbm_thread), PROT_READ | PROT_WRITE, METADATA_MMAP_OPTS, -1, 0);
+  dbm_thread *data = mambo_internal_mmap(sizeof(dbm_thread), PROT_READ | PROT_WRITE,
+                                         METADATA_MMAP_OPTS, METADATA_PAGE_SIZE);
   if (data != MAP_FAILED) {
     *thread_data = data;
     return true;
@@ -408,14 +438,18 @@ void init_thread(dbm_thread *thread_data) {
   dbm_thread **dispatcher_thread_data;
 
   // Initialize code cache
-  thread_data->code_cache = mmap(NULL, sizeof(dbm_code_cache), PROT_EXEC | PROT_READ | PROT_WRITE, CC_MMAP_OPTS, -1, 0);
+  thread_data->code_cache = mambo_internal_mmap(sizeof(dbm_code_cache),
+                                                PROT_EXEC | PROT_READ | PROT_WRITE,
+                                                CC_MMAP_OPTS, CC_PAGE_SIZE);
   if (thread_data->code_cache == MAP_FAILED) {
     fprintf(stderr, "Allocating code cache space failed\n");
     while(1);
   }
   info("Code cache: %p\n", thread_data->code_cache);
 
-  thread_data->cc_links = mmap(NULL, sizeof(ll) + sizeof(ll_entry) * MAX_CC_LINKS, PROT_READ | PROT_WRITE, METADATA_MMAP_OPTS, -1, 0);
+  thread_data->cc_links = mambo_internal_mmap(sizeof(ll) + sizeof(ll_entry) * MAX_CC_LINKS,
+                                              PROT_READ | PROT_WRITE,
+                                              METADATA_MMAP_OPTS, METADATA_PAGE_SIZE);
   assert(thread_data->cc_links != MAP_FAILED);
 
   // Initialize the hash table and basic block allocator, mark all BBs as unknown type
@@ -717,4 +751,3 @@ void main(int argc, char **argv, char **envp) {
   #define ARGDIFF 2
   elf_run(block_address, argv[1], argc-ARGDIFF, &argv[ARGDIFF], envp, &auxv);
 }
-
