@@ -888,6 +888,16 @@ int _a64_calc_ld_st_addr(mambo_context *ctx, enum reg reg) {
       _generate_addr(ctx, reg, rn, reg_invalid, 0);
       return 0;
     }
+    case A64_LDADD:
+    case A64_LDCLR:
+    case A64_LDEOR:
+    case A64_LDSET:
+    case A64_SWP: {
+      uint32_t size, a, r, rs, rn, rt;
+      a64_LDADD_decode_fields(ctx->code.read_address, &size, &a, &r, &rs, &rn, &rt);
+      _generate_addr(ctx, reg, rn, reg_invalid, 0);
+      return 0;
+    }
   }
 
   return -1;
@@ -1580,6 +1590,16 @@ int _a64_get_ld_st_size(mambo_context *ctx) {
           break;
       }
       size = (1 << scale) * regs;
+      break;
+    }
+    case A64_LDADD:
+    case A64_LDCLR:
+    case A64_LDEOR:
+    case A64_LDSET:
+    case A64_SWP: {
+      uint32_t sz, a, r, rs, rn, rt;
+      a64_LDADD_decode_fields(ctx->code.read_address, &sz, &a, &r, &rs, &rn, &rt);
+      size = 1 << sz;
       break;
     }
   } // switch
