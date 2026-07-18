@@ -30,8 +30,10 @@
 #include "../plugins.h"
 
 struct instructions {
+  uint64_t total;
   uint64_t integer;
   uint64_t floating;
+  uint64_t vector;
   uint64_t load;
   uint64_t store;
   uint64_t branch;
@@ -71,8 +73,10 @@ int instruction_count_pre_thread_handler(mambo_context *ctx) {
   assert(counters != NULL);
   mambo_set_thread_plugin_data(ctx, counters);
 
+  counters->total = 0;
   counters->integer = 0;
   counters->floating = 0;
+  counters->vector = 0;
   counters->load = 0;
   counters->store = 0;
   counters->branch = 0;
@@ -93,8 +97,10 @@ int instruction_count_post_thread_handler(mambo_context *ctx) {
   // Prints thread private counters
   print_counters(counters); // comment this out if not needed
 
+  atomic_increment_u64(&global_counters.total, counters->total);
   atomic_increment_u64(&global_counters.integer, counters->integer);
   atomic_increment_u64(&global_counters.floating, counters->floating);
+  atomic_increment_u64(&global_counters.vector, counters->vector);
   atomic_increment_u64(&global_counters.load, counters->load);
   atomic_increment_u64(&global_counters.store, counters->store);
   atomic_increment_u64(&global_counters.branch, counters->branch);
@@ -110,6 +116,8 @@ int instruction_count_post_thread_handler(mambo_context *ctx) {
 int instruction_count_pre_inst_handler(mambo_context *ctx) {
   struct instructions *counters = mambo_get_thread_plugin_data(ctx);
   uint64_t *inst_counter = NULL;
+
+  emit_counter64_incr(ctx, &counters->total, 1);
 
 #ifdef __aarch64__
   // Variables are used for decoding the fields of intructions
@@ -237,6 +245,7 @@ int instruction_count_pre_inst_handler(mambo_context *ctx) {
   case A64_CRYPTO_AES:
   case A64_CRYPTO_SHA_REG3:
   case A64_CRYPTO_SHA_REG2:
+    inst_counter = &counters->vector;
     break;
 
   default:
@@ -245,6 +254,18 @@ int instruction_count_pre_inst_handler(mambo_context *ctx) {
 
 #elif __riscv
   switch (ctx->code.inst) {
+    case RISCV_V_OP:
+    case RISCV_V_LOAD_B:
+    case RISCV_V_LOAD_H:
+    case RISCV_V_LOAD_W:
+    case RISCV_V_LOAD_D:
+    case RISCV_V_STORE_B:
+    case RISCV_V_STORE_H:
+    case RISCV_V_STORE_W:
+    case RISCV_V_STORE_D:
+      inst_counter = &counters->vector;
+      break;
+
     case RISCV_C_ADDI4SPN:
     case RISCV_C_NOP:
     case RISCV_C_ADDI:
@@ -476,8 +497,10 @@ int instruction_count_exit_handler(mambo_context *ctx) {
 
 void print_counters(struct instructions *counters) {
   // Auxiliary function to print the counters
+  fprintf(stderr, "  total   : %'" PRIu64 "\n", counters->total);
   fprintf(stderr, "  integer : %'" PRIu64 "\n", counters->integer);
   fprintf(stderr, "  floating: %'" PRIu64 "\n", counters->floating);
+  fprintf(stderr, "  vector  : %'" PRIu64 "\n", counters->vector);
   fprintf(stderr, "  load    : %'" PRIu64 "\n", counters->load);
   fprintf(stderr, "  store   : %'" PRIu64 "\n", counters->store);
   fprintf(stderr, "  branch  : %'" PRIu64 "\n", counters->branch);
