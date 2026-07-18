@@ -290,6 +290,8 @@ bool mambo_is_load(mambo_context *ctx);
 bool mambo_is_store(mambo_context *ctx);
 bool mambo_is_load_or_store(mambo_context *ctx);
 int mambo_get_ld_st_size(mambo_context *ctx);
+bool mambo_is_rvv_mem(mambo_context *ctx);
+int mambo_calc_rvv_ld_st_size(mambo_context *ctx, enum reg size_reg, enum reg scratch_reg);
 int mambo_add_identity_mapping(mambo_context *ctx);
 char *mambo_get_cb_function_name(mambo_context *ctx);
 int mambo_stop_scan(mambo_context *ctx);

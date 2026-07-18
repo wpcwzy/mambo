@@ -56,6 +56,7 @@ int mtrace_pre_inst_handler(mambo_context *ctx) {
   bool is_load = mambo_is_load(ctx);
   bool is_store = mambo_is_store(ctx);
   if (is_load || is_store) {
+    bool is_rvv = mambo_is_rvv_mem(ctx);
     mambo_cond cond = mambo_get_cond(ctx);
     mambo_branch skip_br;
     int ret;
@@ -65,7 +66,7 @@ int mtrace_pre_inst_handler(mambo_context *ctx) {
     }
 
 #ifdef __riscv
-    emit_push(ctx, (1 << a0) | (1 << a1) | (1 << a2) | (1 << lr));
+    emit_push(ctx, (1 << a0) | (1 << a1) | (1 << a2) | (1 << a3) | (1 << lr));
 #else
     emit_push(ctx, (1 << 0) | (1 << 1) | (1 << 2) | (1 << lr));
 #endif
@@ -76,21 +77,35 @@ int mtrace_pre_inst_handler(mambo_context *ctx) {
     ret = mambo_calc_ld_st_addr(ctx, 0);
 #endif
     assert(ret == 0);
+
+#ifdef __riscv
+    if (is_rvv) {
+      // RVV size is dynamic: compute the byte count into a1 (a3 = scratch),
+      // then fold in the store bit to build info = (size << 1) | is_store.
+      ret = mambo_calc_rvv_ld_st_size(ctx, a1, a3);
+      assert(ret == 0);
+      emit_riscv_slli(ctx, a1, a1, 1);
+      if (is_store) {
+        emit_riscv_ori(ctx, a1, a1, 1);
+      }
+    } else {
+      int size = mambo_get_ld_st_size(ctx);
+      assert(size > 0);
+      emit_set_reg(ctx, a1, (size << 1) | (is_store ? 1 : 0));
+    }
+    emit_set_reg_ptr(ctx, a2, &mtrace_buf->entries);
+#else
     int size = mambo_get_ld_st_size(ctx);
     assert(size > 0);
 
     uintptr_t info = (size << 1) | (is_store ? 1 : 0);
-#ifdef __riscv
-    emit_set_reg(ctx, a1, info);
-    emit_set_reg_ptr(ctx, a2, &mtrace_buf->entries);
-#else
     emit_set_reg(ctx, 1, info);
     emit_set_reg_ptr(ctx, 2, &mtrace_buf->entries);
 #endif
     emit_fcall(ctx, mtrace_buf_write);
 
 #ifdef __riscv
-    emit_pop(ctx, (1 << a0) | (1 << a1) | (1 << a2) | (1 << lr));
+    emit_pop(ctx, (1 << a0) | (1 << a1) | (1 << a2) | (1 << a3) | (1 << lr));
 #else
     emit_pop(ctx, (1 << 0) | (1 << 1) | (1 << 2) | (1 << lr));
 #endif

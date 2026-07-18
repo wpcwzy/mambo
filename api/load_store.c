@@ -1197,6 +1197,103 @@ int _riscv_calc_ld_st_addr(mambo_context *ctx, enum reg reg) {
       break;
     }
 
+    case RISCV_V_LOAD_B: {
+      unsigned int lumop;
+      unsigned int rs1;
+      unsigned int vd;
+      riscv_v_load_b_decode_fields(inst, &lumop, &rs1, &vd);
+      _generate_addr(ctx, reg, rs1, reg_invalid, 0);
+      break;
+    }
+    case RISCV_V_LOAD_H: {
+      unsigned int lumop;
+      unsigned int rs1;
+      unsigned int vd;
+      riscv_v_load_h_decode_fields(inst, &lumop, &rs1, &vd);
+      _generate_addr(ctx, reg, rs1, reg_invalid, 0);
+      break;
+    }
+    case RISCV_V_LOAD_W: {
+      unsigned int lumop;
+      unsigned int rs1;
+      unsigned int vd;
+      riscv_v_load_w_decode_fields(inst, &lumop, &rs1, &vd);
+      _generate_addr(ctx, reg, rs1, reg_invalid, 0);
+      break;
+    }
+    case RISCV_V_LOAD_D: {
+      unsigned int lumop;
+      unsigned int rs1;
+      unsigned int vd;
+      riscv_v_load_d_decode_fields(inst, &lumop, &rs1, &vd);
+      _generate_addr(ctx, reg, rs1, reg_invalid, 0);
+      break;
+    }
+    case RISCV_V_STORE_B: {
+      unsigned int sumop;
+      unsigned int rs1;
+      unsigned int vs3;
+      riscv_v_store_b_decode_fields(inst, &sumop, &rs1, &vs3);
+      _generate_addr(ctx, reg, rs1, reg_invalid, 0);
+      break;
+    }
+    case RISCV_V_STORE_H: {
+      unsigned int sumop;
+      unsigned int rs1;
+      unsigned int vs3;
+      riscv_v_store_h_decode_fields(inst, &sumop, &rs1, &vs3);
+      _generate_addr(ctx, reg, rs1, reg_invalid, 0);
+      break;
+    }
+    case RISCV_V_STORE_W: {
+      unsigned int sumop;
+      unsigned int rs1;
+      unsigned int vs3;
+      riscv_v_store_w_decode_fields(inst, &sumop, &rs1, &vs3);
+      _generate_addr(ctx, reg, rs1, reg_invalid, 0);
+      break;
+    }
+    case RISCV_V_STORE_D: {
+      unsigned int sumop;
+      unsigned int rs1;
+      unsigned int vs3;
+      riscv_v_store_d_decode_fields(inst, &sumop, &rs1, &vs3);
+      _generate_addr(ctx, reg, rs1, reg_invalid, 0);
+      break;
+    }
+    case RISCV_V_AMO_B: {
+      unsigned int amoop;
+      unsigned int rs1;
+      unsigned int vd;
+      riscv_v_amo_b_decode_fields(inst, &amoop, &rs1, &vd);
+      _generate_addr(ctx, reg, rs1, reg_invalid, 0);
+      break;
+    }
+    case RISCV_V_AMO_H: {
+      unsigned int amoop;
+      unsigned int rs1;
+      unsigned int vd;
+      riscv_v_amo_h_decode_fields(inst, &amoop, &rs1, &vd);
+      _generate_addr(ctx, reg, rs1, reg_invalid, 0);
+      break;
+    }
+    case RISCV_V_AMO_W: {
+      unsigned int amoop;
+      unsigned int rs1;
+      unsigned int vd;
+      riscv_v_amo_w_decode_fields(inst, &amoop, &rs1, &vd);
+      _generate_addr(ctx, reg, rs1, reg_invalid, 0);
+      break;
+    }
+    case RISCV_V_AMO_D: {
+      unsigned int amoop;
+      unsigned int rs1;
+      unsigned int vd;
+      riscv_v_amo_d_decode_fields(inst, &amoop, &rs1, &vd);
+      _generate_addr(ctx, reg, rs1, reg_invalid, 0);
+      break;
+    }
+
 
     case RISCV_LB: {
       unsigned int rd;
@@ -1481,6 +1578,9 @@ int _riscv_calc_ld_st_addr(mambo_context *ctx, enum reg reg) {
       break;
     }
 
+    default:
+      fprintf(stderr, "Address decoding for RISC-V instruction %d not implemented yet\n", ctx->code.inst);
+      return -1;
   }
 }
 
@@ -1972,6 +2072,9 @@ int _riscv_get_ld_st_size(mambo_context *ctx) {
       size = 8;
       break;
     }
+
+    /* RVV vector loads/stores have no statically-known size; they return -1
+     * here and are handled dynamically via mambo_calc_rvv_ld_st_size(). */
   }
   return size;
 }
@@ -1990,6 +2093,149 @@ int mambo_get_ld_st_size(mambo_context *ctx) {
   return _riscv_get_ld_st_size(ctx);
 #endif
   return -1;
+}
+
+/*
+ * RVV vector memory accesses do not have a statically-known size: the number of
+ * bytes touched depends on the runtime CSR state (vl/vstart/vtype/vlenb). These
+ * instructions therefore return -1 from mambo_get_ld_st_size(); plugins that
+ * want to account for them must emit code that computes the size at execution
+ * time via mambo_calc_rvv_ld_st_size() below.
+ */
+bool mambo_is_rvv_mem(mambo_context *ctx) {
+#ifdef __riscv
+  if (ctx->code.inst == -1) return false;
+  switch (ctx->code.inst) {
+    case RISCV_V_LOAD_B:
+    case RISCV_V_LOAD_H:
+    case RISCV_V_LOAD_W:
+    case RISCV_V_LOAD_D:
+    case RISCV_V_STORE_B:
+    case RISCV_V_STORE_H:
+    case RISCV_V_STORE_W:
+    case RISCV_V_STORE_D:
+    case RISCV_V_AMO_B:
+    case RISCV_V_AMO_H:
+    case RISCV_V_AMO_W:
+    case RISCV_V_AMO_D:
+      return true;
+  }
+#endif
+  return false;
+}
+
+#ifdef __riscv
+/* RVV control and status registers. */
+#define RISCV_CSR_VSTART 0x008
+#define RISCV_CSR_VL     0xC20
+#define RISCV_CSR_VTYPE  0xC21
+#define RISCV_CSR_VLENB  0xC22
+
+/* log2 of a power-of-two element/field count (1,2,4,8 -> 0,1,2,3). */
+static unsigned int __riscv_log2_pow2(unsigned int v) {
+  unsigned int log = 0;
+  while (v > 1) { v >>= 1; log++; }
+  return log;
+}
+#endif
+
+/*
+ * Emit code that computes, at execution time, the total number of bytes
+ * accessed by the current RVV memory instruction into `size_reg`, using
+ * `scratch_reg` as a temporary. Both registers must be caller-saved and free;
+ * only these two registers are clobbered. Returns 0 on success, or -1 if the
+ * current instruction is not an RVV memory access.
+ *
+ * The RVV memory encoding is decoded straight from the instruction word:
+ *
+ *   31  29 28  27 26 25 24    20 19  15 14 12 11  7 6      0
+ *    nf    mew   mop  vm  lumop/rs2  rs1   width   vd/vs3  opcode
+ *
+ *   width[14:12]: 000->8b, 101->16b, 110->32b, 111->64b element width (EEW)
+ *   mop  [27:26]: 00 unit-stride, 01/11 indexed, 10 strided
+ *   lumop[24:20]: form selector when mop==00 (0x00 unit, 0x08 whole-register,
+ *                 0x0b mask, 0x10 fault-only-first)
+ *   nf   [31:29]: NFIELDS-1 (segmented / whole-register field count)
+ *
+ * Byte counts, with active = vl - vstart and nf_count = nf + 1:
+ *   unit-stride / strided / fault-only-first : active * EEW * nf_count
+ *   indexed                                  : active * SEW * nf_count
+ *                                              (data element uses SEW, not EEW)
+ *   mask (vlm/vsm)                           : ceil(vl / 8)
+ *   whole-register (vlNre/vsNr)              : nf_count * VLEN/8 (vlenb)
+ */
+int mambo_calc_rvv_ld_st_size(mambo_context *ctx, enum reg size_reg, enum reg scratch_reg) {
+#ifdef __riscv
+  if (!mambo_is_rvv_mem(ctx)) return -1;
+
+  uint32_t w      = *(uint32_t *)ctx->code.read_address;
+  uint32_t opcode = w & 0x7f;
+  uint32_t width  = (w >> 12) & 0x7;
+  uint32_t lumop  = (w >> 20) & 0x1f;
+  uint32_t mop    = (w >> 26) & 0x3;
+  uint32_t nf     = (w >> 29) & 0x7;
+
+  unsigned int eew_bytes;
+  switch (width) {
+    case 0x5: eew_bytes = 2; break; // e16
+    case 0x6: eew_bytes = 4; break; // e32
+    case 0x7: eew_bytes = 8; break; // e64
+    case 0x0: // e8
+    default:  eew_bytes = 1; break;
+  }
+
+  bool is_amo         = (opcode == 0x2f);
+  bool is_whole_reg   = (!is_amo && mop == 0 && lumop == 0x08);
+  bool is_mask        = (!is_amo && mop == 0 && lumop == 0x0b);
+  bool is_indexed     = (!is_amo && (mop == 1 || mop == 3));
+  /* Vector AMOs (deprecated Zvamo) have no segment count. */
+  unsigned int nf_count = is_amo ? 1 : (nf + 1);
+  unsigned int log2_nf  = __riscv_log2_pow2(nf_count);
+
+  if (is_whole_reg) {
+    /* nf_count * VLEN/8 bytes, independent of vl/vstart. */
+    emit_riscv_csrrs(ctx, size_reg, RISCV_CSR_VLENB, zero);
+    if (log2_nf) {
+      emit_riscv_slli(ctx, size_reg, size_reg, log2_nf);
+    }
+    return 0;
+  }
+
+  if (is_mask) {
+    /* vlm/vsm transfer ceil(vl/8) bytes with EEW=8. */
+    emit_riscv_csrrs(ctx, size_reg, RISCV_CSR_VL, zero);
+    emit_riscv_addi(ctx, size_reg, size_reg, 7);
+    emit_riscv_srli(ctx, size_reg, size_reg, 3);
+    return 0;
+  }
+
+  /* Remaining forms scale the active element count. */
+  emit_riscv_csrrs(ctx, size_reg, RISCV_CSR_VL, zero);      // size = vl
+  emit_riscv_csrrs(ctx, scratch_reg, RISCV_CSR_VSTART, zero); // scratch = vstart
+  emit_riscv_sub(ctx, size_reg, size_reg, scratch_reg);      // size = active
+
+  if (is_indexed) {
+    /* Indexed loads/stores move data elements of SEW bytes (from vtype),
+     * not the width field (which encodes the index EEW). */
+    emit_riscv_csrrs(ctx, scratch_reg, RISCV_CSR_VTYPE, zero);
+    emit_riscv_srli(ctx, scratch_reg, scratch_reg, 3); // vsew is vtype[5:3]
+    emit_riscv_andi(ctx, scratch_reg, scratch_reg, 7);
+    if (log2_nf) {
+      emit_riscv_addi(ctx, scratch_reg, scratch_reg, log2_nf);
+    }
+    emit_riscv_sll(ctx, size_reg, size_reg, scratch_reg); // active << (vsew+log2_nf)
+  } else {
+    /* unit-stride, strided, fault-only-first, and vector AMO: EEW is static. */
+    unsigned int shift = __riscv_log2_pow2(eew_bytes) + log2_nf;
+    if (shift) {
+      emit_riscv_slli(ctx, size_reg, size_reg, shift);
+    }
+  }
+  return 0;
+#else
+  (void)ctx; (void)size_reg; (void)scratch_reg;
+  return -1;
+#endif
 }
 
 
