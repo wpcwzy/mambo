@@ -127,6 +127,7 @@ dbm_thread *dbm_create_thread(dbm_thread *thread_data, void *next_inst, sys_clon
   new_thread_data->clone_args = args;
   new_thread_data->pstack = pstack;
   new_thread_data->shared_parent_data = thread_data->shared_parent_data;
+  new_thread_data->protect_std_fds = thread_data->protect_std_fds;
 
 
   pthread_attr_t attr;
@@ -370,7 +371,9 @@ int syscall_handler_pre(uintptr_t syscall_no, uintptr_t *args, uint16_t *next_in
       dbm_exit(thread_data, args[0]);
       break;
     case __NR_close:
-      if (args[0] <= 2) { // stdin, stdout, stderr
+      /* Preserve the launcher process' own stdio, but let forked children
+         redirect or close their descriptors normally. */
+      if (thread_data->protect_std_fds && args[0] <= 2) { // stdin, stdout, stderr
         args[0] = 0;
         do_syscall = 0;
       }

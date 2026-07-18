@@ -42,10 +42,6 @@ def generate_header(insts, inst_len)
   insts.each do |inst|
     puts "  #{ARGV[0].upcase}_#{inst[:name].upcase},"
   end
-  # RVV decoding is handled as a generic major-opcode fallback in
-  # scanner_riscv.c.  Keep its synthetic enum in the generated header so it
-  # survives every `make pie` regeneration.
-  puts "  RISCV_VECTOR," if ARGV[0] == "riscv"
   puts "  #{ARGV[0].upcase}_INVALID"  
   puts "} #{ARGV[0]}_instruction;"
   generate_f_prot(insts, inst_len_to_cptr(inst_len))

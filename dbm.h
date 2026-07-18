@@ -271,6 +271,7 @@ struct dbm_thread_s {
   volatile pid_t *set_tid;
   sys_clone_args *clone_args;
   bool clone_vm;
+  bool protect_std_fds;
   int pending_signals[_NSIG];
   uint32_t is_signal_pending;
   void *pstack;
@@ -494,4 +495,3 @@ int function_watch_add(watched_functions_t *self, char *name, int plugin_id,
 #endif
 
 #endif
-

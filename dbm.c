@@ -433,6 +433,7 @@ void init_thread(dbm_thread *thread_data) {
   *dispatcher_is_pending = &thread_data->is_signal_pending;
 
   debug("*thread_data in dispatcher at: %p\n", dispatcher_thread_data);
+  thread_data->protect_std_fds = true;
 
 #ifdef DBM_TRACES
   thread_data->trace_head_incr_addr = (uintptr_t)&thread_data->code_cache[0] + trace_head_incr_offset;
@@ -484,6 +485,7 @@ void free_all_other_threads(dbm_thread *thread_data) {
 
 void reset_process(dbm_thread *thread_data) {
   thread_data->tid = syscall(__NR_gettid);
+  thread_data->protect_std_fds = false;
 
   int ret = pthread_mutex_init(&global_data.thread_list_mutex, NULL);
   assert(ret == 0);
@@ -717,4 +719,3 @@ void main(int argc, char **argv, char **envp) {
   #define ARGDIFF 2
   elf_run(block_address, argv[1], argc-ARGDIFF, &argv[ARGDIFF], envp, &auxv);
 }
-
