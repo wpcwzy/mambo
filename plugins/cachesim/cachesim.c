@@ -28,6 +28,14 @@
 #include "cachesim_buffer.h"
 #include "cachesim_model.h"
 
+// Select exactly one cache profile here.
+// #define CACHESIM_TARGET_SPACEMIT_X60
+#define CACHESIM_TARGET_NEOVERSE_N1
+
+#if defined(CACHESIM_TARGET_SPACEMIT_X60) && defined(CACHESIM_TARGET_NEOVERSE_N1)
+#error "Select only one cachesim target profile"
+#endif
+
 // Instruction cache configurations
 
 // Cortex-A5, Cortex-A7
@@ -73,13 +81,33 @@
 */
 
 // Cortex-A57, Cortex-A72
+/*
 #define L1I_SIZE       (48 * 1024)
 #define L1I_LINE_SIZE  64
 #define L1I_ASSOC      3
 #define L1I_REPL       REPLACE_LRU
 #define L1I_MAX_FETCH  16
+*/
 
-// Data cache configurations
+// SpacemiT X60
+#ifdef CACHESIM_TARGET_SPACEMIT_X60
+#define L1I_SIZE       (32 * 1024)
+#define L1I_LINE_SIZE  64
+#define L1I_ASSOC      4
+#define L1I_REPL       REPLACE_LRU
+#define L1I_MAX_FETCH  16
+#endif
+
+// Neoverse-N1
+#ifdef CACHESIM_TARGET_NEOVERSE_N1
+#define L1I_SIZE       (64 * 1024)
+#define L1I_LINE_SIZE  64
+#define L1I_ASSOC      4
+#define L1I_REPL       REPLACE_LRU
+#define L1I_MAX_FETCH  16
+#endif
+
+// ***Data cache configurations***
 
 // Cortex-A5, Cortex-A9
 /*
@@ -102,10 +130,28 @@
 */
 
 // Cortex-A15, Cortex-A57, Cortex-A72
+/*
 #define L1D_SIZE       (32 * 1024) // always 32 KiB
 #define L1D_LINE_SIZE  64
 #define L1D_ASSOC      2
 #define L1D_REPL       REPLACE_LRU
+*/
+
+// SpacemiT X60
+#ifdef CACHESIM_TARGET_SPACEMIT_X60
+#define L1D_SIZE       (32 * 1024) // always 32 KiB
+#define L1D_LINE_SIZE  64
+#define L1D_ASSOC      4
+#define L1D_REPL       REPLACE_LRU
+#endif
+
+// Neoverse-N1
+#ifdef CACHESIM_TARGET_NEOVERSE_N1
+#define L1D_SIZE       (64 * 1024) // 64 KiB
+#define L1D_LINE_SIZE  64
+#define L1D_ASSOC      4
+#define L1D_REPL       REPLACE_LRU
+#endif
 
 // Denver 2
 /*
@@ -117,11 +163,16 @@
 
 
 //#define L2_SIZE       (256*1024)
-//#define L2_SIZE       (512*1024)
+// SpacemiT X60
+#ifdef CACHESIM_TARGET_SPACEMIT_X60
+#define L2_SIZE       (512*1024)
+#endif
+// Neoverse-N1
+#ifdef CACHESIM_TARGET_NEOVERSE_N1
 #define L2_SIZE       (1*1024*1024)
-//#define L2_SIZE       (2*1024*1024)
+#endif
 #define L2_LINE_SIZE  64
-#define L2_ASSOC      16
+#define L2_ASSOC      8
 #define L2_REPL       REPLACE_RANDOM
 
 typedef struct {

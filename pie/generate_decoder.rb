@@ -288,4 +288,3 @@ if (is_header)
 else
   generate_decoder(insts, inst_len)
 end
-
