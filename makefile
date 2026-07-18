@@ -59,6 +59,12 @@ ifeq ($(ARCH),aarch64)
 	SOURCES += signals.c
 endif
 ifeq ($(ARCH), riscv64)
+	# Build with the V extension so __riscv_vector is defined. This enables the
+	# guest vector-state save/restore (push_v/pop_v) in the dispatcher; without
+	# it, MAMBO clobbers the guest's vtype/vl/vstart/v0-v31 across every
+	# dispatcher round-trip, corrupting any guest that uses RVV. Overridable via
+	# RISCV_MARCH for hosts without the V extension.
+	CFLAGS += -march=$(or $(RISCV_MARCH),rv64gcv)
 	HEADERS += api/emit_riscv.h
 	LDFLAGS += -Wl,-Ttext-segment=$(or $(TEXT_SEGMENT),0x7f000000)
 	PIE += pie/pie-riscv-field-decoder.o
