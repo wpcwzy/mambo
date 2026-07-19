@@ -606,7 +606,7 @@ int addr_to_fragment_id(dbm_thread * const thread_data, const uintptr_t addr) {
   int pivot;
 
   if (addr >= thread_data->code_cache_meta[last].tpc) {
-    assert((void *)addr < (((void *)&thread_data->code_cache) + sizeof(dbm_code_cache)));
+    assert((void *)addr < (((void *)thread_data->code_cache) + sizeof(dbm_code_cache)));
     return last;
   }
 

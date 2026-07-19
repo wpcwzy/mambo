@@ -312,6 +312,13 @@ void a64_check_free_space(dbm_thread *thread_data, uint32_t **write_p,
   int basic_block;
 
   if ((((uint64_t)*write_p) + size) >= (uint64_t)*data_p) {
+    /* Basic-block fragments allocate contiguous overflow blocks and grow
+       seamlessly. Trace fragments (cur_block >= CODE_CACHE_SIZE) instead have
+       data_p pinned to the end of the trace cache, so reaching here for a trace
+       means the trace cache is exhausted; chaining into a basic-block block would
+       corrupt the cache. This must be prevented upstream (see TRACE_LIMIT_OFFSET
+       checks in create_trace/trace_dispatcher); fail fast if it ever is not. */
+    assert(cur_block < CODE_CACHE_SIZE && "trace fragment overflowed the trace cache");
     basic_block = allocate_bb_overflow(thread_data);
     thread_data->code_cache_meta[basic_block].actual_id = cur_block;
     if ((uint32_t *)&thread_data->code_cache->blocks[basic_block] != *data_p) {

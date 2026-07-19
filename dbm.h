@@ -55,7 +55,14 @@
 #define TRACE_FRAGMENT_OVERP 50
 #define MAX_BRANCH_RANGE (16*1024*1024)
 #define TRACE_CACHE_SIZE (MAX_BRANCH_RANGE - (CODE_CACHE_SIZE*BASIC_BLOCK_SIZE * 4))
-#define TRACE_LIMIT_OFFSET (2*1024)
+/* Space kept free at the end of the trace cache. Trace fragments are emitted
+   linearly with data_p pinned to the end of the trace cache (see scan_a64), so a
+   fragment must never be started unless a whole worst-case fragment still fits:
+   unlike a basic block, an overflowing trace cannot spill into a contiguous
+   overflow block, it would be mis-redirected into the basic-block region and
+   corrupt the cache. Reserve the same worst-case single-fragment span that
+   CODE_CACHE_OVERP reserves for basic-block overflow. */
+#define TRACE_LIMIT_OFFSET (CODE_CACHE_OVERP * BASIC_BLOCK_SIZE * 4)
 
 #define TRACE_ALIGN 4 // must be a power of 2
 #define TRACE_ALIGN_MASK (TRACE_ALIGN-1)

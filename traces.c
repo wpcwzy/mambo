@@ -695,6 +695,20 @@ void trace_dispatcher(uintptr_t target, uintptr_t *next_addr, uint32_t source_in
     return;
   }
 
+  // Terminate the trace if the trace cache no longer has room for another
+  // fragment. Trace fragments are written linearly with data_p pinned to the end
+  // of the trace cache (scan_a64), so overrunning it cannot be absorbed by an
+  // overflow block the way a basic block can; a64_check_free_space would instead
+  // mis-redirect the trace into the basic-block region and corrupt the cache.
+  // The cache is flushed on the next create_trace() via its own limit check.
+  if ((uintptr_t)thread_data->active_trace.write_p >=
+      (uintptr_t)thread_data->code_cache + MAX_BRANCH_RANGE - TRACE_LIMIT_OFFSET) {
+    addr = active_trace_lookup_or_scan(thread_data, target);
+    early_trace_exit(thread_data, bb_meta, write_p, target, addr);
+    *next_addr = addr;
+    return;
+  }
+
   // Check if the fragment count has reached the max limit
   if (thread_data->trace_fragment_count > MAX_TRACE_FRAGMENTS) {
     debug("Trace fragment count limit, branch to: 0x%" PRIxPTR ", written at: %p\n", target, write_p);
