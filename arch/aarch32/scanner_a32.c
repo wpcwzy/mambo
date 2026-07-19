@@ -177,7 +177,7 @@ void arm_check_free_space(dbm_thread *thread_data, uint32_t **write_p,
   assert(*write_p < (*data_p)+BASIC_BLOCK_SIZE);
 
   if ((((uint32_t)*write_p)+size) >= (uint32_t)*data_p) {
-    basic_block = allocate_bb(thread_data);
+    basic_block = allocate_bb_overflow(thread_data);
     thread_data->code_cache_meta[basic_block].actual_id = cur_block;
     if (*write_p >= *data_p) {
       assert(&thread_data->code_cache->blocks[basic_block].words[0] == *data_p);

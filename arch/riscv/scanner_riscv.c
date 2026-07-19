@@ -784,7 +784,7 @@ void riscv_check_free_space(dbm_thread *thread_data, uint16_t **write_p,
   int basic_block;
 
   if ((((uint64_t)*write_p) + size) >= (uint64_t)*data_p) {
-    basic_block = allocate_bb(thread_data);
+    basic_block = allocate_bb_overflow(thread_data);
     thread_data->code_cache_meta[basic_block].actual_id = cur_block;
     if ((uint32_t *)&thread_data->code_cache->blocks[basic_block] != *data_p) {
       uintptr_t target = (uintptr_t)&thread_data->code_cache->blocks[basic_block];

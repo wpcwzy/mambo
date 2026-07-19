@@ -175,6 +175,16 @@ inline uintptr_t lookup_or_scan_with_cached(dbm_thread * const thread_data,
     return _lookup_or_scan(thread_data, target, cached);
 }
 
+/* Allocate a basic block for a *new* fragment.
+
+   May flush the code cache when it is nearly full, so this must only ever be
+   called at a fragment boundary (before any code has been emitted for the
+   fragment being started). It must NOT be used to allocate the additional
+   blocks needed when a fragment overflows its current block mid-scan: a flush
+   there would move the newly returned block ~MAX_BRANCH_RANGE bytes away from
+   the code already emitted for the fragment, and the short direct branch used
+   to chain them (JAL on RISC-V has only a +/-1MiB range) would be unable to
+   reach it. Use allocate_bb_overflow() for that. */
 int allocate_bb(dbm_thread *thread_data) {
   // Reserve CODE_CACHE_OVERP basic blocks to be able to scan large blocks
   if(thread_data->free_block >= (CODE_CACHE_SIZE - CODE_CACHE_OVERP)) {
@@ -182,6 +192,18 @@ int allocate_bb(dbm_thread *thread_data) {
     flush_code_cache(thread_data);
   }
 
+  return thread_data->free_block++;
+}
+
+/* Allocate an additional, contiguous basic block while scanning a fragment
+   that has overflowed its current block. Unlike allocate_bb() this never
+   flushes: the fragment already holds emitted code that is chained to the
+   returned block with a short direct branch, so the block must stay adjacent
+   in memory. The CODE_CACHE_OVERP reserve (see allocate_bb) exists precisely
+   so these blocks are available without a flush; CODE_CACHE_OVERP must be at
+   least as large as the maximum number of blocks a single fragment can span. */
+int allocate_bb_overflow(dbm_thread *thread_data) {
+  assert(thread_data->free_block < CODE_CACHE_SIZE);
   return thread_data->free_block++;
 }
 

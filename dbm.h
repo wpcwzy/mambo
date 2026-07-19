@@ -46,7 +46,12 @@
   #define CODE_CACHE_SIZE 65000
 #endif
 #define TRACE_FRAGMENT_NO 60000
-#define CODE_CACHE_OVERP 30
+/* Basic blocks reserved so a fragment that overflows its first block can keep
+   allocating contiguous overflow blocks (via allocate_bb_overflow) without a
+   flush moving them out of a short branch's reach. Must exceed the maximum
+   number of blocks a single fragment can span; heavily instrumented builds
+   have been observed at ~67 blocks, so this leaves generous headroom. */
+#define CODE_CACHE_OVERP 512
 #define TRACE_FRAGMENT_OVERP 50
 #define MAX_BRANCH_RANGE (16*1024*1024)
 #define TRACE_CACHE_SIZE (MAX_BRANCH_RANGE - (CODE_CACHE_SIZE*BASIC_BLOCK_SIZE * 4))
@@ -386,6 +391,7 @@ uint32_t scan_t32(dbm_thread *thread_data, uint16_t *read_address, int basic_blo
 size_t   scan_a64(dbm_thread *thread_data, uint32_t *read_address, int basic_block, cc_type type, uint32_t *write_p);
 size_t   scan_riscv(dbm_thread *thread_data, uint16_t *read_address, int basic_block, cc_type type, uint16_t *write_p);
 int allocate_bb(dbm_thread *thread_data);
+int allocate_bb_overflow(dbm_thread *thread_data);
 void trace_dispatcher(uintptr_t target, uintptr_t *next_addr, uint32_t source_index, dbm_thread *thread_data);
 void flush_code_cache(dbm_thread *thread_data);
 void insert_cond_exit_branch(dbm_code_cache_meta *bb_meta, void **o_write_p, int cond);
