@@ -211,6 +211,28 @@ void cachesim_proc_buf(cachesim_trace_t *trace_buf) {
   trace_buf->len = 0;
 }
 
+#ifdef __riscv
+/*
+ * inst_code() reserves the "a1 = fragment_size << 1" immediate as a placeholder
+ * and set_inst_size() back-patches it in place once the fragment size is known.
+ * emit_set_reg() must NOT be used for this on RISC-V: it emits a variable number
+ * of instructions (a single ADDIW for the zero placeholder, but LUI+ADDIW once
+ * the value needs bit 11 and above, i.e. fragment_size << 1 >= 0x800 -- fragments
+ * larger than ~1KB, which aggressive inlining readily produces). A wider patch
+ * than the reserved placeholder overruns it and clobbers the following a2
+ * (trace-buffer pointer) load, corrupting a2 and causing a wild store in
+ * cachesim_buf_write(). Always emit a fixed-width LUI+ADDIW pair (8 bytes) so the
+ * reserved slot and the patch are the same size. Mirrors the LUI+ADDIW form of
+ * riscv_copy_to_reg_32bits(); fragment_size << 1 is capped in range below.
+ */
+static void emit_fixed_inst_size(mambo_context *ctx, uint32_t value) {
+  uint32_t hi20 = ((value + 0x800) >> 12) & 0xFFFFF;
+  uint32_t lo12 = value & 0xFFF;
+  emit_riscv_lui(ctx, a1, hi20);
+  emit_riscv_addiw(ctx, a1, a1, lo12);
+}
+#endif
+
 void inst_code(mambo_context *ctx, cachesim_thread_t *cachesim_thread) {
 #ifdef __riscv
   emit_push(ctx, (1 << a0) | (1 << a1) | (1 << a2) | (1 << lr));
@@ -224,7 +246,7 @@ void inst_code(mambo_context *ctx, cachesim_thread_t *cachesim_thread) {
   emit_set_reg_ptr(ctx, a0, addr);
 
   cachesim_thread->set_inst_size = mambo_get_cc_addr(ctx);
-  emit_set_reg(ctx, a1, 0);
+  emit_fixed_inst_size(ctx, 0);
 
   emit_set_reg_ptr(ctx, a2, &cachesim_thread->inst_trace_buf.entries);
 #else
@@ -248,7 +270,7 @@ void set_inst_size(mambo_context *ctx, cachesim_thread_t *cachesim_thread ) {
   void *tmp = mambo_get_cc_addr(ctx);
   mambo_set_cc_addr(ctx, cachesim_thread->set_inst_size);
 #ifdef __riscv
-  emit_set_reg(ctx, a1, cachesim_thread->fragment_size << 1);
+  emit_fixed_inst_size(ctx, cachesim_thread->fragment_size << 1);
 #else
   emit_set_reg(ctx, 1, cachesim_thread->fragment_size << 1);
 #endif

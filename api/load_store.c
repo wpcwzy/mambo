@@ -1582,6 +1582,8 @@ int _riscv_calc_ld_st_addr(mambo_context *ctx, enum reg reg) {
       fprintf(stderr, "Address decoding for RISC-V instruction %d not implemented yet\n", ctx->code.inst);
       return -1;
   }
+
+  return 0;
 }
 
 #endif
