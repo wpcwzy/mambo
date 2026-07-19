@@ -29,8 +29,8 @@
 #include "cachesim_model.h"
 
 // Select exactly one cache profile here.
-// #define CACHESIM_TARGET_SPACEMIT_X60
-#define CACHESIM_TARGET_NEOVERSE_N1
+#define CACHESIM_TARGET_SPACEMIT_X60
+// #define CACHESIM_TARGET_NEOVERSE_N1
 
 #if defined(CACHESIM_TARGET_SPACEMIT_X60) && defined(CACHESIM_TARGET_NEOVERSE_N1)
 #error "Select only one cachesim target profile"
@@ -172,7 +172,7 @@
 #define L2_SIZE       (1*1024*1024)
 #endif
 #define L2_LINE_SIZE  64
-#define L2_ASSOC      8
+#define L2_ASSOC      16
 #define L2_REPL       REPLACE_RANDOM
 
 typedef struct {
