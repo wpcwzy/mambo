@@ -43,6 +43,7 @@
 #define NOP_INSTRUCTION      0xD503201F
 #define THIRTY_TWO_KB        32 * 1024
 #define ONE_MEGABYTE         1024 * 1024
+#define TRACE_EXIT_STUB_GUARD (16 * 1024)
 #endif
 
 #ifdef DEBUG
@@ -137,6 +138,28 @@ void get_cond_branch_attributes(uintptr_t inst_addr, uint32_t *mask, int64_t *ma
       (void *)inst_addr, instruction);
       while(1);
   }
+}
+
+static bool trace_exit_stubs_fit(dbm_thread *thread_data, uint8_t *stub_start) {
+  uint32_t *exit_stub_addr = (uint32_t *)stub_start;
+
+  for (int i = 0; i < thread_data->active_trace.free_exit_rec; i++) {
+    uint32_t *from = (uint32_t *)thread_data->active_trace.exits[i].from;
+    uint32_t mask;
+    int64_t max;
+
+    exit_stub_addr = (uint32_t *)((((uintptr_t)exit_stub_addr) + 0xF) & ~0xF);
+    get_cond_branch_attributes(thread_data->active_trace.exits[i].from, &mask, &max);
+
+    int64_t offset = (uintptr_t)exit_stub_addr - (uintptr_t)from;
+    if (!is_offset_within_range(offset, max)) {
+      return false;
+    }
+
+    exit_stub_addr += 4;
+  }
+
+  return true;
 }
 
 void patch_trace_branches(dbm_thread *thread_data, uint32_t *orig_branch, uintptr_t tpc) {
@@ -709,6 +732,16 @@ void trace_dispatcher(uintptr_t target, uintptr_t *next_addr, uint32_t source_in
     return;
   }
 
+#ifdef __aarch64__
+  if (!trace_exit_stubs_fit(thread_data,
+                            thread_data->active_trace.write_p + TRACE_EXIT_STUB_GUARD)) {
+    addr = active_trace_lookup_or_scan(thread_data, target);
+    early_trace_exit(thread_data, bb_meta, write_p, target, addr);
+    *next_addr = addr;
+    return;
+  }
+#endif
+
   // Check if the fragment count has reached the max limit
   if (thread_data->trace_fragment_count > MAX_TRACE_FRAGMENTS) {
     debug("Trace fragment count limit, branch to: 0x%" PRIxPTR ", written at: %p\n", target, write_p);
@@ -729,6 +762,7 @@ void trace_dispatcher(uintptr_t target, uintptr_t *next_addr, uint32_t source_in
 
   debug("\n   Trace fragment: 0x%" PRIxPTR "\n", target);
   int fragment_id;
+  uint8_t *fragment_start = thread_data->active_trace.write_p;
 #ifdef __arm__
   fragment_len = scan_trace(thread_data, (uint16_t *)target, mambo_trace, &fragment_id);
 #endif
@@ -738,6 +772,15 @@ void trace_dispatcher(uintptr_t target, uintptr_t *next_addr, uint32_t source_in
   debug("len: %" PRIdPTR "\n\n", fragment_len);
 
   thread_data->active_trace.write_p += fragment_len;
+#ifdef __aarch64__
+  if (!trace_exit_stubs_fit(thread_data, thread_data->active_trace.write_p)) {
+    thread_data->active_trace.write_p = fragment_start;
+    addr = active_trace_lookup_or_scan(thread_data, target);
+    early_trace_exit(thread_data, bb_meta, fragment_start, target, addr);
+    *next_addr = addr;
+    return;
+  }
+#endif
   switch(thread_data->code_cache_meta[fragment_id].exit_branch_type) {
 #ifdef __arm__
     case uncond_reg_thumb:
