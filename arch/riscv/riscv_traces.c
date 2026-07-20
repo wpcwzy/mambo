@@ -137,6 +137,11 @@ void install_trace(dbm_thread *thread_data) {
       patch_trace_branches(thread_data, (uint16_t *)orig_branch, tpc);
     } else {
       int current_bb = addr_to_bb_id(thread_data, cc_link->data);
+      /* A flush during a previous iteration's active_trace_lookup_or_scan() below
+         resets cc_links and every linked_from list, so the iterator now points at
+         reused/zeroed memory and cc_link->data can be garbage (e.g. 0), which maps
+         to id -1. Stop before indexing code_cache_meta[-1]. */
+      if (current_bb < 0) break;
       int actual_bb = thread_data->code_cache_meta[current_bb].actual_id;
       if (actual_bb != 0) {
         current_bb = actual_bb;
@@ -186,8 +191,20 @@ void install_trace(dbm_thread *thread_data) {
       }
     }
 
+    /* active_trace_lookup_or_scan() above (branch_riscv path) can scan a new BB
+       and trigger flush_code_cache(), which wipes cc_links / linked_from and the
+       active trace. If that happened, this trace and the iterator are dead: stop
+       now and let the caller re-resolve via lookup_or_scan(). */
+    if (thread_data->was_flushed) break;
+
     cc_link = cc_link->next;
     __clear_cache((void *)c_orig_branch, (void *)orig_branch);
+  }
+
+  if (thread_data->was_flushed) {
+    /* Cache was flushed mid-install: entry_address, active_trace, trace_id and
+       trace_cache_next have all been reset. Do not commit the (now stale) trace. */
+    return;
   }
 
   hash_add(&thread_data->entry_address, spc, tpc);
@@ -272,6 +289,11 @@ void early_trace_exit(dbm_thread *thread_data, dbm_code_cache_meta *bb_meta,
   thread_data->active_trace.write_p = (uint8_t *)write_p;
   install_trace(thread_data);
 
+  /* install_trace() may have flushed the code cache; bb_meta then refers to a
+     reset fragment. Callers detect the flush via thread_data->was_flushed and
+     re-resolve next_addr, so just skip the now-meaningless status update. */
+  if (thread_data->was_flushed) return;
+
   bb_meta->branch_cache_status |= BOTH_LINKED;
 }
 
@@ -320,8 +342,18 @@ void create_trace(dbm_thread *thread_data, uint16_t bb_source, uintptr_t *ret_ad
          thread_data->active_trace.id, thread_data->active_trace.write_p,
          thread_data->active_trace.source_bb, thread_data->active_trace.entry_addr);
 
+    thread_data->was_flushed = false;
     fragment_len = scan_trace(thread_data, source_addr, mambo_trace_entry, &trace_id);
     debug("len: %d\n\n", fragment_len);
+
+    /* Building the first fragment can scan new BBs and flush the code cache,
+       which resets the active trace we just set up. Abort and re-resolve from
+       the source PC rather than committing a stale trace (mirrors the proactive
+       capacity check above). */
+    if (thread_data->was_flushed) {
+      *ret_addr = lookup_or_scan(thread_data, (uintptr_t)source_addr);
+      return;
+    }
 
     switch(thread_data->code_cache_meta[trace_id].exit_branch_type) {
       case jal_riscv:
@@ -427,7 +459,8 @@ void trace_dispatcher(uintptr_t target, uintptr_t *next_addr, uint32_t source_in
                               RISCV_TRACE_EXIT_STUB_MAX_SIZE)) {
     addr = active_trace_lookup_or_scan(thread_data, target);
     early_trace_exit(thread_data, bb_meta, write_p, target, addr);
-    *next_addr = addr;
+    *next_addr = thread_data->was_flushed
+                   ? lookup_or_scan(thread_data, target) : addr;
     return;
   }
 
@@ -439,7 +472,8 @@ void trace_dispatcher(uintptr_t target, uintptr_t *next_addr, uint32_t source_in
       record_cc_link(thread_data, (uintptr_t)write_p, addr);
     }
     early_trace_exit(thread_data, bb_meta, write_p, target, addr);
-    *next_addr = addr;
+    *next_addr = thread_data->was_flushed
+                   ? lookup_or_scan(thread_data, target) : addr;
     return;
   }
 
@@ -449,7 +483,8 @@ void trace_dispatcher(uintptr_t target, uintptr_t *next_addr, uint32_t source_in
   debug("Hash lookup for 0x%x: 0x%x\n", target, addr);
   if (addr != UINT_MAX) {
     early_trace_exit(thread_data, bb_meta, write_p, target, addr);
-    *next_addr = addr;
+    *next_addr = thread_data->was_flushed
+                   ? lookup_or_scan(thread_data, target) : addr;
     return;
   }
 
@@ -461,6 +496,13 @@ void trace_dispatcher(uintptr_t target, uintptr_t *next_addr, uint32_t source_in
   fragment_len = scan_trace(thread_data, (uint16_t *)target, mambo_trace, &fragment_id);
   debug("len: %d\n\n", fragment_len);
 
+  /* scan_trace() can scan new BBs and flush the code cache, resetting the active
+     trace. Bail before using the now-stale active_trace.write_p below. */
+  if (thread_data->was_flushed) {
+    *next_addr = lookup_or_scan(thread_data, target);
+    return;
+  }
+
   if (fragment_len == 0) {
     thread_data->active_trace.write_p = start_addr;
     thread_data->active_trace.id = trace_id_start;
@@ -471,7 +513,8 @@ void trace_dispatcher(uintptr_t target, uintptr_t *next_addr, uint32_t source_in
       record_cc_link(thread_data, (uintptr_t)write_p, addr);
     }
     early_trace_exit(thread_data, bb_meta, write_p, target, addr);
-    *next_addr = addr;
+    *next_addr = thread_data->was_flushed
+                   ? lookup_or_scan(thread_data, target) : addr;
     return;
   }
 
@@ -482,7 +525,8 @@ void trace_dispatcher(uintptr_t target, uintptr_t *next_addr, uint32_t source_in
     thread_data->active_trace.free_exit_rec = exit_rec_start;
     addr = active_trace_lookup_or_scan(thread_data, target);
     early_trace_exit(thread_data, bb_meta, fragment_start, target, addr);
-    *next_addr = addr;
+    *next_addr = thread_data->was_flushed
+                   ? lookup_or_scan(thread_data, target) : addr;
     return;
   }
 
@@ -490,6 +534,14 @@ void trace_dispatcher(uintptr_t target, uintptr_t *next_addr, uint32_t source_in
     case jalr_riscv:
       install_trace(thread_data);
       break;
+  }
+
+  /* install_trace() (jalr case) may have flushed the code cache, resetting
+     active_trace.write_p. The fragment_end fixup below would then write into and
+     return a stale trace address, sending execution to freed cache. Re-resolve. */
+  if (thread_data->was_flushed) {
+    *next_addr = lookup_or_scan(thread_data, target);
+    return;
   }
 
   // Insert pop a0 and a1 and jump to start of fragment
