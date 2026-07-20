@@ -37,6 +37,8 @@
 #define WHOLE_TRACE 4000
 #define TRACE_PADDING 1000
 #define TRACE_EXIT 15
+#define RISCV_B_BRANCH_RANGE 4096
+#define RISCV_TRACE_EXIT_STUB_MAX_SIZE 20
 
 #ifdef DBM_TRACES
 #ifdef __riscv
@@ -71,6 +73,28 @@ int riscv_tribi_jump_to(uint16_t **o_write_p, uintptr_t target) {
     ret = riscv_jalr_helper((uint16_t **)o_write_p, target, zero, a0);
   }
   return ret;
+}
+
+static bool riscv_b_branch_can_reach(uintptr_t from, uintptr_t target) {
+  intptr_t offset = (intptr_t)target - (intptr_t)from;
+  return !(offset & 1) &&
+         offset >= -RISCV_B_BRANCH_RANGE &&
+         offset < RISCV_B_BRANCH_RANGE;
+}
+
+static bool trace_exit_stubs_fit(dbm_thread *thread_data, uint8_t *stub_start) {
+  uintptr_t stub_addr = (uintptr_t)stub_start;
+
+  for (int i = 0; i < thread_data->active_trace.free_exit_rec; i++) {
+    uintptr_t from = thread_data->active_trace.exits[i].from;
+    if (!riscv_b_branch_can_reach(from, stub_addr)) {
+      return false;
+    }
+
+    stub_addr += RISCV_TRACE_EXIT_STUB_MAX_SIZE;
+  }
+
+  return true;
 }
 
 void set_up_trace_exit(dbm_thread *thread_data, uint16_t **o_write_p, uintptr_t target) {
@@ -185,10 +209,9 @@ void install_trace(dbm_thread *thread_data) {
   thread_data->trace_cache_next = thread_data->active_trace.write_p;
 
 
-  /* Add traps to the source basic block to detect if it remains reachable */
-  uint16_t *write_p = (uint16_t *)(thread_data->code_cache_meta[bb_source].tpc + 6);
-  riscv_c_ebreak(&write_p);
-  __clear_cache(write_p, write_p + 2);
+  /* RISC-V does not currently have a recoverable SIGTRAP unlink path. Leaving
+     the source block intact is preferable to killing the process if it remains
+     reachable through an unrecorded link. */
 }
 
 void set_up_trace_exit_branch_placeholder(dbm_thread *thread_data,
@@ -399,6 +422,15 @@ void trace_dispatcher(uintptr_t target, uintptr_t *next_addr, uint32_t source_in
     return;
   }
 
+  if (!trace_exit_stubs_fit(thread_data,
+                            thread_data->active_trace.write_p +
+                              RISCV_TRACE_EXIT_STUB_MAX_SIZE)) {
+    addr = active_trace_lookup_or_scan(thread_data, target);
+    early_trace_exit(thread_data, bb_meta, write_p, target, addr);
+    *next_addr = addr;
+    return;
+  }
+
   if (thread_data->trace_fragment_count > MAX_TRACE_FRAGMENTS) {
     debug("Trace fragment count limit, branch to: 0x%x, written at: %p\n", target, write_p);
     addr = active_trace_lookup(thread_data, target);
@@ -423,11 +455,16 @@ void trace_dispatcher(uintptr_t target, uintptr_t *next_addr, uint32_t source_in
 
   debug("\n   Trace fragment: 0x%x\n", target);
   int fragment_id;
+  uint8_t *fragment_start = thread_data->active_trace.write_p;
+  int trace_id_start = thread_data->active_trace.id;
+  int exit_rec_start = thread_data->active_trace.free_exit_rec;
   fragment_len = scan_trace(thread_data, (uint16_t *)target, mambo_trace, &fragment_id);
   debug("len: %d\n\n", fragment_len);
 
   if (fragment_len == 0) {
     thread_data->active_trace.write_p = start_addr;
+    thread_data->active_trace.id = trace_id_start;
+    thread_data->active_trace.free_exit_rec = exit_rec_start;
     addr = active_trace_lookup(thread_data, target);
     if (addr == UINT_MAX) {
       addr = active_trace_lookup_or_scan(thread_data, target);
@@ -439,6 +476,16 @@ void trace_dispatcher(uintptr_t target, uintptr_t *next_addr, uint32_t source_in
   }
 
   thread_data->active_trace.write_p += 2 * fragment_len;
+  if (!trace_exit_stubs_fit(thread_data, thread_data->active_trace.write_p)) {
+    thread_data->active_trace.write_p = fragment_start;
+    thread_data->active_trace.id = trace_id_start;
+    thread_data->active_trace.free_exit_rec = exit_rec_start;
+    addr = active_trace_lookup_or_scan(thread_data, target);
+    early_trace_exit(thread_data, bb_meta, fragment_start, target, addr);
+    *next_addr = addr;
+    return;
+  }
+
   switch(thread_data->code_cache_meta[fragment_id].exit_branch_type) {
     case jalr_riscv:
       install_trace(thread_data);
@@ -457,4 +504,3 @@ void trace_dispatcher(uintptr_t target, uintptr_t *next_addr, uint32_t source_in
 }
 #endif
 #endif
-
