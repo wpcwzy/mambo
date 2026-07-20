@@ -336,11 +336,18 @@ int syscall_handler_pre(uintptr_t syscall_no, uintptr_t *args, uint16_t *next_in
       struct kernel_sigaction *act = (struct kernel_sigaction *)args[1];
       if (act != NULL) {
         handler = (uintptr_t)act->k_sa_handler;
+#ifndef __riscv
+        // Signal handling is not implemented for RISC-V (see dbm.c). On other
+        // architectures redirect the application's handler through MAMBO's
+        // signal_trampoline so signals can be translated. On RISC-V the
+        // trampoline has no body, so installing it would make the kernel jump
+        // into unrelated code on delivery; install the real handler instead.
         // Never remove the UNLINK_SIGNAL handler, which is used internally by MAMBO
         if (args[0] == UNLINK_SIGNAL || (act->k_sa_handler != SIG_IGN && act->k_sa_handler != SIG_DFL)) {
           act->k_sa_handler = (__sighandler_t)signal_trampoline;
           act->sa_flags |= SA_SIGINFO;
         }
+#endif
       }
 
       // A mutex is used to ensure that changes to the handler and all other options appear atomic
