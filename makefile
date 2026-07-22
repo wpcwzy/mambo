@@ -32,7 +32,7 @@ CFLAGS+=-DVERSION=\"$(VERSION)\"
 
 LDFLAGS+=-static -ldl
 LIBS=-lelf -lzstd -lpthread -lz
-HEADERS=*.h makefile plugins/xtrace_disasm.h
+HEADERS=*.h makefile plugins/xtrace_disasm.h plugins/xtrace_format.h plugins/xtrace_zstd.h
 INCLUDES=-I/usr/include/libelf -I.
 SOURCES= common.c dbm.c traces.c syscalls.c dispatcher.c util.S traces_common.c
 SOURCES+=api/helpers.c api/plugin_support.c api/branch_decoder_support.c api/load_store.c api/internal.c api/hash_table.c
@@ -81,7 +81,7 @@ ifdef PLUGINS
 	CFLAGS += -DPLUGINS_NEW
 endif
 
-.PHONY: pie clean cleanall xtrace
+.PHONY: pie clean cleanall xtrace xtrace-decode
 
 all:
 	$(info MAMBO: detected architecture "$(ARCH)")
@@ -110,12 +110,16 @@ memcheck:
 
 xtrace:
 	$(MAKE) PLUGINS="plugins/xtrace.c" OUTPUT_FILE=mambo_xtrace
+	$(MAKE) xtrace-decode
+
+xtrace-decode: pie plugins/xtrace_disasm.h plugins/xtrace_format.h plugins/xtrace_zstd.h plugins/xtrace.c
+	$(CC) $(CFLAGS) $(INCLUDES) -DXTRACE_DECODER -o xtrace_decode plugins/xtrace.c $(PIE) $(or $(ZSTD_LIB),-lzstd)
 
 plugins/xtrace_disasm.h: plugins/generate_xtrace_disasm.rb pie/riscv.txt pie/a64.txt pie/arm.txt pie/thumb.txt
 	ruby plugins/generate_xtrace_disasm.rb > $@
 
 clean:
-	rm -f dbm elf/elf_loader.o elf/symbol_parser.o plugins/xtrace_disasm.h
+	rm -f dbm xtrace_decode elf/elf_loader.o elf/symbol_parser.o plugins/xtrace_disasm.h
 
 cleanall: clean
 	$(MAKE) -C pie/ clean

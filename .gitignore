@@ -1,4 +1,7 @@
 dbm
+xtrace_decode
+xtrace.bin
+pinatrace.out
 api/emit_*.c
 api/emit_*.h
 plugins/xtrace_disasm.h

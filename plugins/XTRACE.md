@@ -1,0 +1,88 @@
+# Xtrace
+
+Xtrace uses an online capture/offline decode pipeline by default. The runtime
+records fixed-size events into a per-thread buffer, compresses each full block
+with zstd, and writes the block under one output-lock acquisition. Instruction
+formatting and disassembly run only in `xtrace_decode`.
+
+## Build and run
+
+```sh
+make xtrace
+MAMBO_XTRACE_FILE=workload.xtr ./mambo_xtrace ./workload
+./xtrace_decode workload.xtr pinatrace.out
+```
+
+`make xtrace` builds both `mambo_xtrace` and `xtrace_decode`. The decoder must
+be built for the trace's ISA because it reuses MAMBO's architecture-specific
+instruction decoder. It may run later or on a separate machine of that ISA.
+
+Binary capture writes `xtrace.bin` by default. The decoder writes text to
+stdout when its second argument is omitted:
+
+```sh
+./xtrace_decode xtrace.bin > pinatrace.out
+```
+
+Use `MAMBO_XTRACE_FILE=-` to stream binary capture on stdout. Diagnostics and
+the final compression summary are written to stderr.
+
+## Configuration
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `MAMBO_XTRACE_FILE` | `xtrace.bin` | Binary capture path; `-` means stdout |
+| `MAMBO_XTRACE_FORMAT` | `binary` | Set to `text` for the legacy online formatter |
+| `MAMBO_XTRACE_COMPRESSION_LEVEL` | `1` | Zstd compression level used per block |
+| `MAMBO_XTRACE_TIMESTAMPS` | `clock` | Sampled `clock`, or `none` to disable timing |
+| `MAMBO_XTRACE_CPU_HZ` | `1600000000` | CPU frequency used to convert sampled nanoseconds to cycles |
+| `MAMBO_XTRACE_RING` | `3` | Ring value emitted by the text decoder |
+| `MAMBO_XTRACE_BASE` | first PC | Override the PC printed by the ring header |
+
+Direct `rdcycle` access is not used because Debian may disable the userspace
+counter and raise `SIGILL`. The default `clock` mode samples
+`CLOCK_MONOTONIC_RAW` once per 256 instructions and converts nanoseconds to
+cycles during decoding using the configured 1.6 GHz frequency. Override the
+frequency when necessary:
+
+```sh
+MAMBO_XTRACE_TIMESTAMPS=clock MAMBO_XTRACE_CPU_HZ=1600000000 \
+  ./mambo_xtrace ./workload
+```
+
+Keep the CPU at that frequency while collecting. Set
+`MAMBO_XTRACE_TIMESTAMPS=none` to emit `@0`, remove timing overhead, and prevent
+`ptr_chase_analyzer` from reporting IPC when timing is not required.
+
+`ptr_chase_analyzer` currently labels its seconds conversion as 3.29 GHz. On an
+RV64 target with another frequency, use the cycle-window IPC value and ignore
+that hard-coded seconds annotation.
+
+The compatibility mode retains the old behavior and default filename:
+
+```sh
+MAMBO_XTRACE_FORMAT=text MAMBO_XTRACE_FILE=pinatrace.out \
+  ./mambo_xtrace ./workload
+```
+
+## Operational notes
+
+Each event is 32 bytes before compression and blocks contain at most 32,768
+events. A crash can therefore leave the current block of each live thread
+unwritten; all completed blocks remain independently decodable. The decoder
+rejects truncated, cross-endian, wrong-version, and wrong-architecture input
+instead of producing partial-looking output.
+
+Blocks from different threads appear in flush order. Per-thread event order and
+instruction-to-memory-access association are preserved, but binary mode does
+not reconstruct a total instruction order across threads. Enable clock
+timestamps when cross-thread timing is needed by a downstream analysis.
+
+During decoding, xtrace inserts a `ring N, pc -> TARGET` line whenever the next
+instruction PC differs from `previous PC + previous instruction length`. This
+reconstructs taken branches, calls, returns, and loop back-edges offline without
+adding a control-flow check to the online capture path.
+
+Compression happens once per block, outside the per-event formatting path.
+Actual size reduction depends on control-flow and address locality; the runtime
+prints raw bytes, stored bytes, and the achieved ratio when capture finishes.

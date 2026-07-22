@@ -15,10 +15,12 @@
   limitations under the License.
 */
 
-#ifdef PLUGINS_NEW
+#if defined(PLUGINS_NEW) || defined(XTRACE_DECODER)
 
 #include <assert.h>
+#include <errno.h>
 #include <inttypes.h>
+#include <pthread.h>
 #include <stdarg.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -28,28 +30,61 @@
 
 #include "../plugins.h"
 #include "xtrace_disasm.h"
+#include "xtrace_format.h"
+#include "xtrace_zstd.h"
 
 #define XTRACE_DEFAULT_FILE "pinatrace.out"
+#define XTRACE_DEFAULT_BINARY_FILE "xtrace.bin"
 #define XTRACE_INFO_LOAD 1
 #define XTRACE_INFO_STORE 2
 #define XTRACE_INFO_SIZE_SHIFT 2
 #define XTRACE_INST_META_INST_BITS 24
 #define XTRACE_INST_META_INST_MASK ((uintptr_t)((1u << XTRACE_INST_META_INST_BITS) - 1))
 #define XTRACE_MAX_BYTE_VALUE 16
+#define XTRACE_EVENTS_PER_BLOCK 32768
+#define XTRACE_TIMESTAMP_SAMPLE_INTERVAL 256
 
+#ifndef XTRACE_DECODER
 struct xtrace_thread {
   uintptr_t store_addr;
   uintptr_t store_info;
   bool store_pending;
+  uint32_t id;
+  uint32_t event_count;
+  uint64_t instruction_count;
+  uintptr_t next_pc;
+  bool has_next_pc;
+  struct xtrace_event *events;
+  void *compressed;
+  size_t compressed_capacity;
+  ZSTD_CCtx *compression_ctx;
 };
 
 static FILE *xtrace_file;
 static bool xtrace_close_file;
 static bool xtrace_ring_written;
 static bool xtrace_has_base_override;
+static bool xtrace_binary = true;
+static bool xtrace_output_failed;
 static uintptr_t xtrace_base_override;
 static int xtrace_ring_level = 3;
+static int xtrace_compression_level = 1;
 static uint64_t xtrace_start_stamp;
+static uint32_t xtrace_next_thread_id;
+static uint64_t xtrace_total_events;
+static uint64_t xtrace_total_raw_bytes;
+static uint64_t xtrace_total_stored_bytes;
+static pthread_mutex_t xtrace_output_lock = PTHREAD_MUTEX_INITIALIZER;
+
+enum xtrace_timestamp_mode {
+  XTRACE_TIMESTAMP_NONE,
+  XTRACE_TIMESTAMP_CLOCK,
+};
+
+static enum xtrace_timestamp_mode xtrace_timestamp_mode =
+    XTRACE_TIMESTAMP_CLOCK;
+static uint64_t xtrace_cpu_hz = 1600000000ull;
+#endif
 
 static void xtrace_appendf(char *buf, size_t cap, size_t *pos,
                            const char *fmt, ...) {
@@ -72,7 +107,14 @@ static void xtrace_appendf(char *buf, size_t cap, size_t *pos,
   }
 }
 
-static uint64_t xtrace_read_stamp(void) {
+static uint64_t xtrace_scale_timestamp(uint64_t nanoseconds,
+                                       uint64_t frequency_hz) {
+  __uint128_t scaled = (__uint128_t)nanoseconds * frequency_hz;
+  return (uint64_t)(scaled / 1000000000ull);
+}
+
+#ifndef XTRACE_DECODER
+static uint64_t xtrace_read_clock_stamp(void) {
   struct timespec ts;
 #ifdef CLOCK_MONOTONIC_RAW
   clock_gettime(CLOCK_MONOTONIC_RAW, &ts);
@@ -80,6 +122,10 @@ static uint64_t xtrace_read_stamp(void) {
   clock_gettime(CLOCK_MONOTONIC, &ts);
 #endif
   return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
+
+static uint64_t xtrace_read_stamp(void) {
+  return xtrace_read_clock_stamp();
 }
 
 static uint64_t xtrace_timestamp(void) {
@@ -108,6 +154,12 @@ static uintptr_t xtrace_inst_meta(mambo_context *ctx) {
   return (inst_type << XTRACE_INST_META_INST_BITS) | inst;
 }
 
+static uintptr_t xtrace_inst_info(mambo_context *ctx) {
+  return (xtrace_inst_meta(ctx) << 4) |
+         ((uintptr_t)mambo_get_inst_len(ctx) & 0xf);
+}
+#endif
+
 static int xtrace_meta_inst_type(uintptr_t meta) {
   return (int)(meta >> XTRACE_INST_META_INST_BITS);
 }
@@ -117,6 +169,7 @@ static int xtrace_meta_inst(uintptr_t meta) {
   return inst == XTRACE_INST_META_INST_MASK ? -1 : (int)inst;
 }
 
+#ifndef XTRACE_DECODER
 static void xtrace_parse_config(void) {
   const char *ring = getenv("MAMBO_XTRACE_RING");
   if (ring != NULL && ring[0] != '\0') {
@@ -128,24 +181,75 @@ static void xtrace_parse_config(void) {
     xtrace_base_override = (uintptr_t)strtoull(base, NULL, 0);
     xtrace_has_base_override = true;
   }
+
+  const char *format = getenv("MAMBO_XTRACE_FORMAT");
+  if (format != NULL && strcmp(format, "text") == 0) {
+    xtrace_binary = false;
+  } else if (format != NULL && strcmp(format, "binary") != 0) {
+    fprintf(stderr, "xtrace: unknown format '%s'; using binary\n", format);
+  }
+
+  const char *cpu_hz = getenv("MAMBO_XTRACE_CPU_HZ");
+  if (cpu_hz != NULL && cpu_hz[0] != '\0') {
+    xtrace_cpu_hz = strtoull(cpu_hz, NULL, 0);
+  }
+
+  const char *timestamps = getenv("MAMBO_XTRACE_TIMESTAMPS");
+  if (timestamps != NULL && timestamps[0] != '\0') {
+    if (strcmp(timestamps, "none") == 0 ||
+        strcmp(timestamps, "logical") == 0) {
+      xtrace_timestamp_mode = XTRACE_TIMESTAMP_NONE;
+    } else if (strcmp(timestamps, "clock") == 0) {
+      xtrace_timestamp_mode = XTRACE_TIMESTAMP_CLOCK;
+    } else if (strcmp(timestamps, "ipc") == 0) {
+      if (xtrace_cpu_hz == 0) {
+        fprintf(stderr,
+                "xtrace: ipc timestamps require MAMBO_XTRACE_CPU_HZ\n");
+        abort();
+      }
+      xtrace_timestamp_mode = XTRACE_TIMESTAMP_CLOCK;
+    } else if (strcmp(timestamps, "cycle") == 0) {
+      fprintf(stderr,
+              "xtrace: direct cycle counters are unsafe; use ipc with "
+              "MAMBO_XTRACE_CPU_HZ\n");
+      abort();
+    } else {
+      fprintf(stderr, "xtrace: unknown timestamp mode '%s'\n", timestamps);
+    }
+  }
+  if (xtrace_timestamp_mode == XTRACE_TIMESTAMP_CLOCK && xtrace_cpu_hz == 0) {
+    fprintf(stderr,
+            "xtrace: clock timestamps require a nonzero MAMBO_XTRACE_CPU_HZ\n");
+    abort();
+  }
+
+  const char *level = getenv("MAMBO_XTRACE_COMPRESSION_LEVEL");
+  if (level != NULL && level[0] != '\0') {
+    xtrace_compression_level = atoi(level);
+  }
 }
 
 static void xtrace_open_file(void) {
   const char *path = getenv("MAMBO_XTRACE_FILE");
   if (path == NULL || path[0] == '\0') {
-    path = XTRACE_DEFAULT_FILE;
+    path = xtrace_binary ? XTRACE_DEFAULT_BINARY_FILE : XTRACE_DEFAULT_FILE;
   }
 
   if (strcmp(path, "-") == 0) {
-    xtrace_file = stderr;
+    xtrace_file = xtrace_binary ? stdout : stderr;
     xtrace_close_file = false;
   } else {
-    xtrace_file = fopen(path, "w");
+    xtrace_file = fopen(path, xtrace_binary ? "wb" : "w");
     xtrace_close_file = true;
   }
 
   if (xtrace_file == NULL) {
-    fprintf(stderr, "xtrace: failed to open %s, falling back to stderr\n", path);
+    fprintf(stderr, "xtrace: failed to open %s: %s\n", path,
+            strerror(errno));
+    if (xtrace_binary) {
+      abort();
+    }
+    fprintf(stderr, "xtrace: falling back to stderr\n");
     xtrace_file = stderr;
     xtrace_close_file = false;
   }
@@ -153,16 +257,20 @@ static void xtrace_open_file(void) {
   setvbuf(xtrace_file, NULL, _IOFBF, 1 << 20);
 }
 
-static void xtrace_print_ring_line(uintptr_t pc) {
-  if (xtrace_ring_written) {
+static void xtrace_print_ring_line(uintptr_t pc, bool discontinuity) {
+  bool first_ring = !xtrace_ring_written;
+  if (!first_ring && !discontinuity) {
     return;
   }
 
-  uintptr_t target = xtrace_has_base_override ? xtrace_base_override : pc;
+  uintptr_t target = first_ring && xtrace_has_base_override
+                         ? xtrace_base_override
+                         : pc;
   fprintf(xtrace_file, "ring %d, pc -> %" PRIxPTR "\n",
           xtrace_ring_level, target);
   xtrace_ring_written = true;
 }
+#endif
 
 static void xtrace_format_bytes(char *buf, size_t cap, size_t *pos,
                                 uintptr_t encoding, uintptr_t inst_len) {
@@ -177,6 +285,7 @@ static void xtrace_format_bytes(char *buf, size_t cap, size_t *pos,
   }
 }
 
+#ifndef XTRACE_DECODER
 static void xtrace_print_mem_value(uintptr_t addr, uintptr_t size) {
   if (size == 0) {
     fprintf(xtrace_file, "?");
@@ -200,6 +309,7 @@ static void xtrace_print_mem_value(uintptr_t addr, uintptr_t size) {
     }
   }
 }
+#endif
 
 #ifdef __aarch64__
 static const char *xtrace_a64_base_reg(unsigned int reg) {
@@ -521,11 +631,12 @@ static int32_t xtrace_riscv_c_imm(unsigned int immhi, unsigned int immlo) {
 }
 
 static void xtrace_append_riscv_operands(char *buf, size_t cap, size_t *pos,
-                                         uintptr_t pc, int inst) {
+                                         uintptr_t pc, uintptr_t encoding,
+                                         int inst) {
   switch ((riscv_instruction)inst) {
     case RISCV_C_ADDI4SPN: {
       unsigned int rd, nzuimm;
-      riscv_c_addi4spn_decode_fields((uint16_t *)pc, &rd, &nzuimm);
+      riscv_c_addi4spn_decode_fields((uint16_t *)&encoding, &rd, &nzuimm);
       xtrace_appendf(buf, cap, pos, " %s, sp, %u",
                      xtrace_riscv_reg(rd + s0),
                      xtrace_riscv_c_addi4spn_imm(nzuimm));
@@ -535,7 +646,7 @@ static void xtrace_append_riscv_operands(char *buf, size_t cap, size_t *pos,
     case RISCV_C_LW:
     case RISCV_C_LD: {
       unsigned int rd, rs1, uimmhi, uimmlo;
-      riscv_c_lw_decode_fields((uint16_t *)pc, &rd, &rs1, &uimmhi, &uimmlo);
+      riscv_c_lw_decode_fields((uint16_t *)&encoding, &rd, &rs1, &uimmhi, &uimmlo);
       unsigned int offset = inst == RISCV_C_LW
                               ? xtrace_riscv_c_word_offset(uimmhi, uimmlo)
                               : xtrace_riscv_c_doubleword_offset(uimmhi, uimmlo);
@@ -554,7 +665,7 @@ static void xtrace_append_riscv_operands(char *buf, size_t cap, size_t *pos,
     case RISCV_C_SW:
     case RISCV_C_SD: {
       unsigned int rs2, rs1, uimmhi, uimmlo;
-      riscv_c_sw_decode_fields((uint16_t *)pc, &rs2, &rs1, &uimmhi, &uimmlo);
+      riscv_c_sw_decode_fields((uint16_t *)&encoding, &rs2, &rs1, &uimmhi, &uimmlo);
       unsigned int offset = inst == RISCV_C_SW
                               ? xtrace_riscv_c_word_offset(uimmhi, uimmlo)
                               : xtrace_riscv_c_doubleword_offset(uimmhi, uimmlo);
@@ -574,7 +685,7 @@ static void xtrace_append_riscv_operands(char *buf, size_t cap, size_t *pos,
     case RISCV_C_LWSP:
     case RISCV_C_LDSP: {
       unsigned int rd, uimmhi, uimmlo;
-      riscv_c_lwsp_decode_fields((uint16_t *)pc, &rd, &uimmhi, &uimmlo);
+      riscv_c_lwsp_decode_fields((uint16_t *)&encoding, &rd, &uimmhi, &uimmlo);
       unsigned int offset = (inst == RISCV_C_LWSP || inst == RISCV_C_FLWSP)
                               ? xtrace_riscv_c_spword_load_offset(uimmhi, uimmlo)
                               : xtrace_riscv_c_spdoubleword_load_offset(uimmhi, uimmlo);
@@ -591,7 +702,7 @@ static void xtrace_append_riscv_operands(char *buf, size_t cap, size_t *pos,
     case RISCV_C_SWSP:
     case RISCV_C_SDSP: {
       unsigned int rs2, uimm;
-      riscv_c_swsp_decode_fields((uint16_t *)pc, &rs2, &uimm);
+      riscv_c_swsp_decode_fields((uint16_t *)&encoding, &rs2, &uimm);
       unsigned int offset = inst == RISCV_C_SWSP
                               ? xtrace_riscv_c_spword_store_offset(uimm)
                               : xtrace_riscv_c_spdoubleword_store_offset(uimm);
@@ -607,7 +718,7 @@ static void xtrace_append_riscv_operands(char *buf, size_t cap, size_t *pos,
     case RISCV_C_ADDI:
     case RISCV_C_ADDIW: {
       unsigned int rd, immhi, immlo;
-      riscv_c_addi_decode_fields((uint16_t *)pc, &rd, &immhi, &immlo);
+      riscv_c_addi_decode_fields((uint16_t *)&encoding, &rd, &immhi, &immlo);
       xtrace_appendf(buf, cap, pos, " %s, %s, %" PRId32,
                      xtrace_riscv_reg(rd), xtrace_riscv_reg(rd),
                      xtrace_riscv_c_imm(immhi, immlo));
@@ -615,7 +726,7 @@ static void xtrace_append_riscv_operands(char *buf, size_t cap, size_t *pos,
     }
     case RISCV_C_LI: {
       unsigned int rd, immhi, immlo;
-      riscv_c_addi_decode_fields((uint16_t *)pc, &rd, &immhi, &immlo);
+      riscv_c_addi_decode_fields((uint16_t *)&encoding, &rd, &immhi, &immlo);
       xtrace_appendf(buf, cap, pos, " %s, %" PRId32,
                      xtrace_riscv_reg(rd),
                      xtrace_riscv_c_imm(immhi, immlo));
@@ -623,14 +734,14 @@ static void xtrace_append_riscv_operands(char *buf, size_t cap, size_t *pos,
     }
     case RISCV_C_ADDI16SP: {
       unsigned int immhi, immlo;
-      riscv_c_addi16sp_decode_fields((uint16_t *)pc, &immhi, &immlo);
+      riscv_c_addi16sp_decode_fields((uint16_t *)&encoding, &immhi, &immlo);
       xtrace_appendf(buf, cap, pos, " sp, sp, %" PRId32,
                      xtrace_riscv_c_addi16sp_imm(immhi, immlo));
       break;
     }
     case RISCV_C_LUI: {
       unsigned int rd, immhi, immlo;
-      riscv_c_lui_decode_fields((uint16_t *)pc, &rd, &immhi, &immlo);
+      riscv_c_lui_decode_fields((uint16_t *)&encoding, &rd, &immhi, &immlo);
       int32_t imm = sign_extend32(18, ((immhi << 5) | immlo) << 12);
       xtrace_appendf(buf, cap, pos, " %s, %" PRId32,
                      xtrace_riscv_reg(rd), imm);
@@ -638,7 +749,7 @@ static void xtrace_append_riscv_operands(char *buf, size_t cap, size_t *pos,
     }
     case RISCV_C_SLLI: {
       unsigned int rs1_rd, shhi, shlo;
-      riscv_c_slli_decode_fields((uint16_t *)pc, &rs1_rd, &shhi, &shlo);
+      riscv_c_slli_decode_fields((uint16_t *)&encoding, &rs1_rd, &shhi, &shlo);
       xtrace_appendf(buf, cap, pos, " %s, %s, %u",
                      xtrace_riscv_reg(rs1_rd), xtrace_riscv_reg(rs1_rd),
                      (shhi << 5) | shlo);
@@ -647,7 +758,7 @@ static void xtrace_append_riscv_operands(char *buf, size_t cap, size_t *pos,
     case RISCV_C_SRLI:
     case RISCV_C_SRAI: {
       unsigned int rs1_rd, shhi, shlo;
-      riscv_c_slli_decode_fields((uint16_t *)pc, &rs1_rd, &shhi, &shlo);
+      riscv_c_slli_decode_fields((uint16_t *)&encoding, &rs1_rd, &shhi, &shlo);
       xtrace_appendf(buf, cap, pos, " %s, %s, %u",
                      xtrace_riscv_reg(rs1_rd + s0),
                      xtrace_riscv_reg(rs1_rd + s0),
@@ -656,7 +767,7 @@ static void xtrace_append_riscv_operands(char *buf, size_t cap, size_t *pos,
     }
     case RISCV_C_ANDI: {
       unsigned int rs1_rd, immhi, immlo;
-      riscv_c_andi_decode_fields((uint16_t *)pc, &rs1_rd, &immhi, &immlo);
+      riscv_c_andi_decode_fields((uint16_t *)&encoding, &rs1_rd, &immhi, &immlo);
       xtrace_appendf(buf, cap, pos, " %s, %s, %" PRId32,
                      xtrace_riscv_reg(rs1_rd + s0),
                      xtrace_riscv_reg(rs1_rd + s0),
@@ -670,7 +781,7 @@ static void xtrace_append_riscv_operands(char *buf, size_t cap, size_t *pos,
     case RISCV_C_SUBW:
     case RISCV_C_ADDW: {
       unsigned int rs1_rd, rs2;
-      riscv_c_sub_decode_fields((uint16_t *)pc, &rs1_rd, &rs2);
+      riscv_c_sub_decode_fields((uint16_t *)&encoding, &rs1_rd, &rs2);
       xtrace_appendf(buf, cap, pos, " %s, %s, %s",
                      xtrace_riscv_reg(rs1_rd + s0),
                      xtrace_riscv_reg(rs1_rd + s0),
@@ -679,7 +790,7 @@ static void xtrace_append_riscv_operands(char *buf, size_t cap, size_t *pos,
     }
     case RISCV_C_ADD: {
       unsigned int rd, rs2;
-      riscv_c_add_decode_fields((uint16_t *)pc, &rd, &rs2);
+      riscv_c_add_decode_fields((uint16_t *)&encoding, &rd, &rs2);
       xtrace_appendf(buf, cap, pos, " %s, %s, %s",
                      xtrace_riscv_reg(rd),
                      xtrace_riscv_reg(rd), xtrace_riscv_reg(rs2));
@@ -687,7 +798,7 @@ static void xtrace_append_riscv_operands(char *buf, size_t cap, size_t *pos,
     }
     case RISCV_C_MV: {
       unsigned int rd, rs2;
-      riscv_c_add_decode_fields((uint16_t *)pc, &rd, &rs2);
+      riscv_c_add_decode_fields((uint16_t *)&encoding, &rd, &rs2);
       xtrace_appendf(buf, cap, pos, " %s, %s",
                      xtrace_riscv_reg(rd), xtrace_riscv_reg(rs2));
       break;
@@ -695,14 +806,14 @@ static void xtrace_append_riscv_operands(char *buf, size_t cap, size_t *pos,
     case RISCV_C_JR:
     case RISCV_C_JALR: {
       unsigned int rs1;
-      riscv_c_jr_decode_fields((uint16_t *)pc, &rs1);
+      riscv_c_jr_decode_fields((uint16_t *)&encoding, &rs1);
       xtrace_appendf(buf, cap, pos, " %s", xtrace_riscv_reg(rs1));
       break;
     }
     case RISCV_C_J:
     case RISCV_C_JAL: {
       unsigned int imm;
-      riscv_c_j_decode_fields((uint16_t *)pc, &imm);
+      riscv_c_j_decode_fields((uint16_t *)&encoding, &imm);
       int32_t offset = xtrace_riscv_c_j_offset(imm);
       xtrace_appendf(buf, cap, pos, " 0x%" PRIxPTR,
                      (uintptr_t)((intptr_t)pc + offset));
@@ -711,7 +822,7 @@ static void xtrace_append_riscv_operands(char *buf, size_t cap, size_t *pos,
     case RISCV_C_BEQZ:
     case RISCV_C_BNEZ: {
       unsigned int rs1, immhi, immlo;
-      riscv_c_beqz_decode_fields((uint16_t *)pc, &rs1, &immhi, &immlo);
+      riscv_c_beqz_decode_fields((uint16_t *)&encoding, &rs1, &immhi, &immlo);
       int32_t offset = xtrace_riscv_c_branch_offset(immhi, immlo);
       xtrace_appendf(buf, cap, pos, " %s, 0x%" PRIxPTR,
                      xtrace_riscv_reg(rs1 + s0),
@@ -726,7 +837,7 @@ static void xtrace_append_riscv_operands(char *buf, size_t cap, size_t *pos,
     case RISCV_LHU:
     case RISCV_LWU: {
       unsigned int rd, rs1, imm;
-      riscv_lw_decode_fields((uint16_t *)pc, &rd, &rs1, &imm);
+      riscv_lw_decode_fields((uint16_t *)&encoding, &rd, &rs1, &imm);
       xtrace_appendf(buf, cap, pos, " %s, %" PRId32 "(%s)",
                      xtrace_riscv_reg(rd), sign_extend32(12, imm),
                      xtrace_riscv_reg(rs1));
@@ -735,7 +846,7 @@ static void xtrace_append_riscv_operands(char *buf, size_t cap, size_t *pos,
     case RISCV_FLW:
     case RISCV_FLD: {
       unsigned int rd, rs1, imm;
-      riscv_flw_decode_fields((uint16_t *)pc, &rd, &rs1, &imm);
+      riscv_flw_decode_fields((uint16_t *)&encoding, &rd, &rs1, &imm);
       xtrace_appendf(buf, cap, pos, " %s, %" PRId32 "(%s)",
                      xtrace_riscv_freg(rd), sign_extend32(12, imm),
                      xtrace_riscv_reg(rs1));
@@ -746,7 +857,7 @@ static void xtrace_append_riscv_operands(char *buf, size_t cap, size_t *pos,
     case RISCV_SW:
     case RISCV_SD: {
       unsigned int rs2, rs1, immhi, immlo;
-      riscv_sw_decode_fields((uint16_t *)pc, &rs2, &rs1, &immhi, &immlo);
+      riscv_sw_decode_fields((uint16_t *)&encoding, &rs2, &rs1, &immhi, &immlo);
       int32_t offset = xtrace_riscv_store_offset(immhi, immlo);
       xtrace_appendf(buf, cap, pos, " %s, %" PRId32 "(%s)",
                      xtrace_riscv_reg(rs2), offset, xtrace_riscv_reg(rs1));
@@ -755,7 +866,7 @@ static void xtrace_append_riscv_operands(char *buf, size_t cap, size_t *pos,
     case RISCV_FSW:
     case RISCV_FSD: {
       unsigned int rs2, rs1, immhi, immlo;
-      riscv_fsw_decode_fields((uint16_t *)pc, &rs2, &rs1, &immhi, &immlo);
+      riscv_fsw_decode_fields((uint16_t *)&encoding, &rs2, &rs1, &immhi, &immlo);
       int32_t offset = xtrace_riscv_store_offset(immhi, immlo);
       xtrace_appendf(buf, cap, pos, " %s, %" PRId32 "(%s)",
                      xtrace_riscv_freg(rs2), offset, xtrace_riscv_reg(rs1));
@@ -763,7 +874,7 @@ static void xtrace_append_riscv_operands(char *buf, size_t cap, size_t *pos,
     }
     case RISCV_FLH: {
       unsigned int offset, rs1, rd;
-      riscv_flh_decode_fields((uint16_t *)pc, &offset, &rs1, &rd);
+      riscv_flh_decode_fields((uint16_t *)&encoding, &offset, &rs1, &rd);
       xtrace_appendf(buf, cap, pos, " %s, %" PRId32 "(%s)",
                      xtrace_riscv_freg(rd), sign_extend32(12, offset),
                      xtrace_riscv_reg(rs1));
@@ -771,7 +882,7 @@ static void xtrace_append_riscv_operands(char *buf, size_t cap, size_t *pos,
     }
     case RISCV_FSH: {
       unsigned int immhi, rs2, rs1, immlo;
-      riscv_fsh_decode_fields((uint16_t *)pc, &immhi, &rs2, &rs1, &immlo);
+      riscv_fsh_decode_fields((uint16_t *)&encoding, &immhi, &rs2, &rs1, &immlo);
       int32_t offset = xtrace_riscv_store_offset(immhi, immlo);
       xtrace_appendf(buf, cap, pos, " %s, %" PRId32 "(%s)",
                      xtrace_riscv_freg(rs2), offset, xtrace_riscv_reg(rs1));
@@ -785,7 +896,7 @@ static void xtrace_append_riscv_operands(char *buf, size_t cap, size_t *pos,
     case RISCV_ANDI:
     case RISCV_ADDIW: {
       unsigned int rd, rs1, imm;
-      riscv_addi_decode_fields((uint16_t *)pc, &rd, &rs1, &imm);
+      riscv_addi_decode_fields((uint16_t *)&encoding, &rd, &rs1, &imm);
       xtrace_appendf(buf, cap, pos, " %s, %s, %" PRId32,
                      xtrace_riscv_reg(rd), xtrace_riscv_reg(rs1),
                      sign_extend32(12, imm));
@@ -798,7 +909,7 @@ static void xtrace_append_riscv_operands(char *buf, size_t cap, size_t *pos,
     case RISCV_SRLIW:
     case RISCV_SRAIW: {
       unsigned int rd, rs1, shamt;
-      riscv_slli_decode_fields((uint16_t *)pc, &rd, &rs1, &shamt);
+      riscv_slli_decode_fields((uint16_t *)&encoding, &rd, &rs1, &shamt);
       xtrace_appendf(buf, cap, pos, " %s, %s, %u",
                      xtrace_riscv_reg(rd), xtrace_riscv_reg(rs1), shamt);
       break;
@@ -807,7 +918,7 @@ static void xtrace_append_riscv_operands(char *buf, size_t cap, size_t *pos,
     case RISCV_CSRRS:
     case RISCV_CSRRC: {
       unsigned int rd, csr, rs1;
-      riscv_csrrw_decode_fields((uint16_t *)pc, &rd, &csr, &rs1);
+      riscv_csrrw_decode_fields((uint16_t *)&encoding, &rd, &csr, &rs1);
       xtrace_appendf(buf, cap, pos, " %s, 0x%x, %s",
                      xtrace_riscv_reg(rd), csr, xtrace_riscv_reg(rs1));
       break;
@@ -816,14 +927,14 @@ static void xtrace_append_riscv_operands(char *buf, size_t cap, size_t *pos,
     case RISCV_CSRRSI:
     case RISCV_CSRRCI: {
       unsigned int rd, csr, uimm;
-      riscv_csrrwi_decode_fields((uint16_t *)pc, &rd, &csr, &uimm);
+      riscv_csrrwi_decode_fields((uint16_t *)&encoding, &rd, &csr, &uimm);
       xtrace_appendf(buf, cap, pos, " %s, 0x%x, %u",
                      xtrace_riscv_reg(rd), csr, uimm);
       break;
     }
     case RISCV_FENCE: {
       unsigned int fm, pred, succ;
-      riscv_fence_decode_fields((uint16_t *)pc, &fm, &pred, &succ);
+      riscv_fence_decode_fields((uint16_t *)&encoding, &fm, &pred, &succ);
       if (fm == 8 && pred == 3 && succ == 3) {
         xtrace_appendf(buf, cap, pos, " tso");
       } else {
@@ -866,7 +977,7 @@ static void xtrace_append_riscv_operands(char *buf, size_t cap, size_t *pos,
     case RISCV_REMW:
     case RISCV_REMUW: {
       unsigned int rd, rs1, rs2;
-      riscv_add_decode_fields((uint16_t *)pc, &rd, &rs1, &rs2);
+      riscv_add_decode_fields((uint16_t *)&encoding, &rd, &rs1, &rs2);
       xtrace_appendf(buf, cap, pos, " %s, %s, %s",
                      xtrace_riscv_reg(rd), xtrace_riscv_reg(rs1),
                      xtrace_riscv_reg(rs2));
@@ -900,7 +1011,7 @@ static void xtrace_append_riscv_operands(char *buf, size_t cap, size_t *pos,
     case RISCV_CZERO_EQZ:
     case RISCV_CZERO_NEZ: {
       unsigned int rs2, rs1, rd;
-      riscv_add_uw_decode_fields((uint16_t *)pc, &rs2, &rs1, &rd);
+      riscv_add_uw_decode_fields((uint16_t *)&encoding, &rs2, &rs1, &rd);
       xtrace_appendf(buf, cap, pos, " %s, %s, %s",
                      xtrace_riscv_reg(rd), xtrace_riscv_reg(rs1),
                      xtrace_riscv_reg(rs2));
@@ -914,7 +1025,7 @@ static void xtrace_append_riscv_operands(char *buf, size_t cap, size_t *pos,
     case RISCV_BINVI:
     case RISCV_BSETI: {
       unsigned int shamt, rs1, rd;
-      riscv_slli_uw_decode_fields((uint16_t *)pc, &shamt, &rs1, &rd);
+      riscv_slli_uw_decode_fields((uint16_t *)&encoding, &shamt, &rs1, &rd);
       xtrace_appendf(buf, cap, pos, " %s, %s, %u",
                      xtrace_riscv_reg(rd), xtrace_riscv_reg(rs1), shamt);
       break;
@@ -931,7 +1042,7 @@ static void xtrace_append_riscv_operands(char *buf, size_t cap, size_t *pos,
     case RISCV_ORC_B:
     case RISCV_REV8: {
       unsigned int rs1, rd;
-      riscv_clz_decode_fields((uint16_t *)pc, &rs1, &rd);
+      riscv_clz_decode_fields((uint16_t *)&encoding, &rs1, &rd);
       xtrace_appendf(buf, cap, pos, " %s, %s",
                      xtrace_riscv_reg(rd), xtrace_riscv_reg(rs1));
       break;
@@ -939,7 +1050,7 @@ static void xtrace_append_riscv_operands(char *buf, size_t cap, size_t *pos,
     case RISCV_LUI:
     case RISCV_AUIPC: {
       unsigned int rd, imm;
-      riscv_lui_decode_fields((uint16_t *)pc, &rd, &imm);
+      riscv_lui_decode_fields((uint16_t *)&encoding, &rd, &imm);
       xtrace_appendf(buf, cap, pos, " %s, 0x%x",
                      xtrace_riscv_reg(rd), imm);
       break;
@@ -947,7 +1058,7 @@ static void xtrace_append_riscv_operands(char *buf, size_t cap, size_t *pos,
     case RISCV_LR_W:
     case RISCV_LR_D: {
       unsigned int aq, rl, rd, rs1;
-      riscv_lr_w_decode_fields((uint16_t *)pc, &aq, &rl, &rd, &rs1);
+      riscv_lr_w_decode_fields((uint16_t *)&encoding, &aq, &rl, &rd, &rs1);
       xtrace_append_riscv_aqrl(buf, cap, pos, aq, rl);
       xtrace_appendf(buf, cap, pos, " %s, (%s)",
                      xtrace_riscv_reg(rd), xtrace_riscv_reg(rs1));
@@ -974,7 +1085,7 @@ static void xtrace_append_riscv_operands(char *buf, size_t cap, size_t *pos,
     case RISCV_AMOMINU_D:
     case RISCV_AMOMAXU_D: {
       unsigned int aq, rl, rd, rs2, rs1;
-      riscv_sc_w_decode_fields((uint16_t *)pc, &aq, &rl, &rd, &rs2, &rs1);
+      riscv_sc_w_decode_fields((uint16_t *)&encoding, &aq, &rl, &rd, &rs2, &rs1);
       xtrace_append_riscv_aqrl(buf, cap, pos, aq, rl);
       xtrace_appendf(buf, cap, pos, " %s, %s, (%s)",
                      xtrace_riscv_reg(rd), xtrace_riscv_reg(rs2),
@@ -990,7 +1101,7 @@ static void xtrace_append_riscv_operands(char *buf, size_t cap, size_t *pos,
     case RISCV_FNMSUB_D:
     case RISCV_FNMADD_D: {
       unsigned int rd, rs1, rs2, rs3, rm;
-      riscv_fmadd_s_decode_fields((uint16_t *)pc, &rd, &rs1, &rs2, &rs3, &rm);
+      riscv_fmadd_s_decode_fields((uint16_t *)&encoding, &rd, &rs1, &rs2, &rs3, &rm);
       xtrace_appendf(buf, cap, pos, " %s, %s, %s, %s, %s",
                      xtrace_riscv_freg(rd), xtrace_riscv_freg(rs1),
                      xtrace_riscv_freg(rs2), xtrace_riscv_freg(rs3),
@@ -1002,7 +1113,7 @@ static void xtrace_append_riscv_operands(char *buf, size_t cap, size_t *pos,
     case RISCV_FNMSUB_H:
     case RISCV_FNMADD_H: {
       unsigned int rs3, rs2, rs1, rm, rd;
-      riscv_fmadd_h_decode_fields((uint16_t *)pc, &rs3, &rs2, &rs1, &rm, &rd);
+      riscv_fmadd_h_decode_fields((uint16_t *)&encoding, &rs3, &rs2, &rs1, &rm, &rd);
       xtrace_appendf(buf, cap, pos, " %s, %s, %s, %s, %s",
                      xtrace_riscv_freg(rd), xtrace_riscv_freg(rs1),
                      xtrace_riscv_freg(rs2), xtrace_riscv_freg(rs3),
@@ -1018,7 +1129,7 @@ static void xtrace_append_riscv_operands(char *buf, size_t cap, size_t *pos,
     case RISCV_FMUL_D:
     case RISCV_FDIV_D: {
       unsigned int rd, rs1, rs2, rm;
-      riscv_fadd_s_decode_fields((uint16_t *)pc, &rd, &rs1, &rs2, &rm);
+      riscv_fadd_s_decode_fields((uint16_t *)&encoding, &rd, &rs1, &rs2, &rm);
       xtrace_appendf(buf, cap, pos, " %s, %s, %s, %s",
                      xtrace_riscv_freg(rd), xtrace_riscv_freg(rs1),
                      xtrace_riscv_freg(rs2), xtrace_riscv_rm(rm));
@@ -1029,7 +1140,7 @@ static void xtrace_append_riscv_operands(char *buf, size_t cap, size_t *pos,
     case RISCV_FMUL_H:
     case RISCV_FDIV_H: {
       unsigned int rs2, rs1, rm, rd;
-      riscv_fadd_h_decode_fields((uint16_t *)pc, &rs2, &rs1, &rm, &rd);
+      riscv_fadd_h_decode_fields((uint16_t *)&encoding, &rs2, &rs1, &rm, &rd);
       xtrace_appendf(buf, cap, pos, " %s, %s, %s, %s",
                      xtrace_riscv_freg(rd), xtrace_riscv_freg(rs1),
                      xtrace_riscv_freg(rs2), xtrace_riscv_rm(rm));
@@ -1038,7 +1149,7 @@ static void xtrace_append_riscv_operands(char *buf, size_t cap, size_t *pos,
     case RISCV_FSQRT_S:
     case RISCV_FSQRT_D: {
       unsigned int rd, rs1, rm;
-      riscv_fsqrt_s_decode_fields((uint16_t *)pc, &rd, &rs1, &rm);
+      riscv_fsqrt_s_decode_fields((uint16_t *)&encoding, &rd, &rs1, &rm);
       xtrace_appendf(buf, cap, pos, " %s, %s, %s",
                      xtrace_riscv_freg(rd), xtrace_riscv_freg(rs1),
                      xtrace_riscv_rm(rm));
@@ -1046,7 +1157,7 @@ static void xtrace_append_riscv_operands(char *buf, size_t cap, size_t *pos,
     }
     case RISCV_FSQRT_H: {
       unsigned int rs1, rm, rd;
-      riscv_fsqrt_h_decode_fields((uint16_t *)pc, &rs1, &rm, &rd);
+      riscv_fsqrt_h_decode_fields((uint16_t *)&encoding, &rs1, &rm, &rd);
       xtrace_appendf(buf, cap, pos, " %s, %s, %s",
                      xtrace_riscv_freg(rd), xtrace_riscv_freg(rs1),
                      xtrace_riscv_rm(rm));
@@ -1063,7 +1174,7 @@ static void xtrace_append_riscv_operands(char *buf, size_t cap, size_t *pos,
     case RISCV_FMIN_D:
     case RISCV_FMAX_D: {
       unsigned int rd, rs1, rs2;
-      riscv_fsgnj_s_decode_fields((uint16_t *)pc, &rd, &rs1, &rs2);
+      riscv_fsgnj_s_decode_fields((uint16_t *)&encoding, &rd, &rs1, &rs2);
       xtrace_appendf(buf, cap, pos, " %s, %s, %s",
                      xtrace_riscv_freg(rd), xtrace_riscv_freg(rs1),
                      xtrace_riscv_freg(rs2));
@@ -1075,7 +1186,7 @@ static void xtrace_append_riscv_operands(char *buf, size_t cap, size_t *pos,
     case RISCV_FMIN_H:
     case RISCV_FMAX_H: {
       unsigned int rs2, rs1, rd;
-      riscv_fsgnj_h_decode_fields((uint16_t *)pc, &rs2, &rs1, &rd);
+      riscv_fsgnj_h_decode_fields((uint16_t *)&encoding, &rs2, &rs1, &rd);
       xtrace_appendf(buf, cap, pos, " %s, %s, %s",
                      xtrace_riscv_freg(rd), xtrace_riscv_freg(rs1),
                      xtrace_riscv_freg(rs2));
@@ -1088,7 +1199,7 @@ static void xtrace_append_riscv_operands(char *buf, size_t cap, size_t *pos,
     case RISCV_FLT_D:
     case RISCV_FLE_D: {
       unsigned int rd, rs1, rs2;
-      riscv_feq_s_decode_fields((uint16_t *)pc, &rd, &rs1, &rs2);
+      riscv_feq_s_decode_fields((uint16_t *)&encoding, &rd, &rs1, &rs2);
       xtrace_appendf(buf, cap, pos, " %s, %s, %s",
                      xtrace_riscv_reg(rd), xtrace_riscv_freg(rs1),
                      xtrace_riscv_freg(rs2));
@@ -1098,7 +1209,7 @@ static void xtrace_append_riscv_operands(char *buf, size_t cap, size_t *pos,
     case RISCV_FLT_H:
     case RISCV_FLE_H: {
       unsigned int rs2, rs1, rd;
-      riscv_feq_h_decode_fields((uint16_t *)pc, &rs2, &rs1, &rd);
+      riscv_feq_h_decode_fields((uint16_t *)&encoding, &rs2, &rs1, &rd);
       xtrace_appendf(buf, cap, pos, " %s, %s, %s",
                      xtrace_riscv_reg(rd), xtrace_riscv_freg(rs1),
                      xtrace_riscv_freg(rs2));
@@ -1109,7 +1220,7 @@ static void xtrace_append_riscv_operands(char *buf, size_t cap, size_t *pos,
     case RISCV_FMV_X_W:
     case RISCV_FMV_X_D: {
       unsigned int rd, rs1;
-      riscv_fmv_x_w_decode_fields((uint16_t *)pc, &rd, &rs1);
+      riscv_fmv_x_w_decode_fields((uint16_t *)&encoding, &rd, &rs1);
       xtrace_appendf(buf, cap, pos, " %s, %s",
                      xtrace_riscv_reg(rd), xtrace_riscv_freg(rs1));
       break;
@@ -1117,7 +1228,7 @@ static void xtrace_append_riscv_operands(char *buf, size_t cap, size_t *pos,
     case RISCV_FCLASS_H:
     case RISCV_FMV_X_H: {
       unsigned int rs1, rd;
-      riscv_fmv_x_h_decode_fields((uint16_t *)pc, &rs1, &rd);
+      riscv_fmv_x_h_decode_fields((uint16_t *)&encoding, &rs1, &rd);
       xtrace_appendf(buf, cap, pos, " %s, %s",
                      xtrace_riscv_reg(rd), xtrace_riscv_freg(rs1));
       break;
@@ -1125,14 +1236,14 @@ static void xtrace_append_riscv_operands(char *buf, size_t cap, size_t *pos,
     case RISCV_FMV_W_X:
     case RISCV_FMV_D_X: {
       unsigned int rd, rs1;
-      riscv_fmv_w_x_decode_fields((uint16_t *)pc, &rd, &rs1);
+      riscv_fmv_w_x_decode_fields((uint16_t *)&encoding, &rd, &rs1);
       xtrace_appendf(buf, cap, pos, " %s, %s",
                      xtrace_riscv_freg(rd), xtrace_riscv_reg(rs1));
       break;
     }
     case RISCV_FMV_H_X: {
       unsigned int rs1, rd;
-      riscv_fmv_h_x_decode_fields((uint16_t *)pc, &rs1, &rd);
+      riscv_fmv_h_x_decode_fields((uint16_t *)&encoding, &rs1, &rd);
       xtrace_appendf(buf, cap, pos, " %s, %s",
                      xtrace_riscv_freg(rd), xtrace_riscv_reg(rs1));
       break;
@@ -1146,7 +1257,7 @@ static void xtrace_append_riscv_operands(char *buf, size_t cap, size_t *pos,
     case RISCV_FCVT_L_D:
     case RISCV_FCVT_LU_D: {
       unsigned int rd, rs1, rm;
-      riscv_fcvt_w_s_decode_fields((uint16_t *)pc, &rd, &rs1, &rm);
+      riscv_fcvt_w_s_decode_fields((uint16_t *)&encoding, &rd, &rs1, &rm);
       xtrace_appendf(buf, cap, pos, " %s, %s, %s",
                      xtrace_riscv_reg(rd), xtrace_riscv_freg(rs1),
                      xtrace_riscv_rm(rm));
@@ -1157,7 +1268,7 @@ static void xtrace_append_riscv_operands(char *buf, size_t cap, size_t *pos,
     case RISCV_FCVT_L_H:
     case RISCV_FCVT_LU_H: {
       unsigned int rs1, rm, rd;
-      riscv_fcvt_w_h_decode_fields((uint16_t *)pc, &rs1, &rm, &rd);
+      riscv_fcvt_w_h_decode_fields((uint16_t *)&encoding, &rs1, &rm, &rd);
       xtrace_appendf(buf, cap, pos, " %s, %s, %s",
                      xtrace_riscv_reg(rd), xtrace_riscv_freg(rs1),
                      xtrace_riscv_rm(rm));
@@ -1172,7 +1283,7 @@ static void xtrace_append_riscv_operands(char *buf, size_t cap, size_t *pos,
     case RISCV_FCVT_D_L:
     case RISCV_FCVT_D_LU: {
       unsigned int rd, rs1, rm;
-      riscv_fcvt_s_w_decode_fields((uint16_t *)pc, &rd, &rs1, &rm);
+      riscv_fcvt_s_w_decode_fields((uint16_t *)&encoding, &rd, &rs1, &rm);
       xtrace_appendf(buf, cap, pos, " %s, %s, %s",
                      xtrace_riscv_freg(rd), xtrace_riscv_reg(rs1),
                      xtrace_riscv_rm(rm));
@@ -1183,7 +1294,7 @@ static void xtrace_append_riscv_operands(char *buf, size_t cap, size_t *pos,
     case RISCV_FCVT_H_L:
     case RISCV_FCVT_H_LU: {
       unsigned int rs1, rm, rd;
-      riscv_fcvt_h_w_decode_fields((uint16_t *)pc, &rs1, &rm, &rd);
+      riscv_fcvt_h_w_decode_fields((uint16_t *)&encoding, &rs1, &rm, &rd);
       xtrace_appendf(buf, cap, pos, " %s, %s, %s",
                      xtrace_riscv_freg(rd), xtrace_riscv_reg(rs1),
                      xtrace_riscv_rm(rm));
@@ -1192,7 +1303,7 @@ static void xtrace_append_riscv_operands(char *buf, size_t cap, size_t *pos,
     case RISCV_FCVT_S_D:
     case RISCV_FCVT_D_S: {
       unsigned int rd, rs1, rm;
-      riscv_fcvt_s_d_decode_fields((uint16_t *)pc, &rd, &rs1, &rm);
+      riscv_fcvt_s_d_decode_fields((uint16_t *)&encoding, &rd, &rs1, &rm);
       xtrace_appendf(buf, cap, pos, " %s, %s, %s",
                      xtrace_riscv_freg(rd), xtrace_riscv_freg(rs1),
                      xtrace_riscv_rm(rm));
@@ -1203,7 +1314,7 @@ static void xtrace_append_riscv_operands(char *buf, size_t cap, size_t *pos,
     case RISCV_FCVT_D_H:
     case RISCV_FCVT_H_D: {
       unsigned int rs1, rm, rd;
-      riscv_fcvt_s_h_decode_fields((uint16_t *)pc, &rs1, &rm, &rd);
+      riscv_fcvt_s_h_decode_fields((uint16_t *)&encoding, &rs1, &rm, &rd);
       xtrace_appendf(buf, cap, pos, " %s, %s, %s",
                      xtrace_riscv_freg(rd), xtrace_riscv_freg(rs1),
                      xtrace_riscv_rm(rm));
@@ -1214,7 +1325,7 @@ static void xtrace_append_riscv_operands(char *buf, size_t cap, size_t *pos,
     case RISCV_CBO_INVAL:
     case RISCV_CBO_ZERO: {
       unsigned int rs1;
-      riscv_cbo_clean_decode_fields((uint16_t *)pc, &rs1);
+      riscv_cbo_clean_decode_fields((uint16_t *)&encoding, &rs1);
       xtrace_appendf(buf, cap, pos, " (%s)", xtrace_riscv_reg(rs1));
       break;
     }
@@ -1222,14 +1333,14 @@ static void xtrace_append_riscv_operands(char *buf, size_t cap, size_t *pos,
     case RISCV_PREFETCH_R:
     case RISCV_PREFETCH_W: {
       unsigned int offset, rs1;
-      riscv_prefetch_i_decode_fields((uint16_t *)pc, &offset, &rs1);
+      riscv_prefetch_i_decode_fields((uint16_t *)&encoding, &offset, &rs1);
       xtrace_appendf(buf, cap, pos, " %u(%s)",
                      offset, xtrace_riscv_reg(rs1));
       break;
     }
     case RISCV_V_OP: {
       unsigned int funct, rs1_vs1, funct3, rd_vd;
-      riscv_v_op_decode_fields((uint16_t *)pc, &funct, &rs1_vs1, &funct3, &rd_vd);
+      riscv_v_op_decode_fields((uint16_t *)&encoding, &funct, &rs1_vs1, &funct3, &rd_vd);
       xtrace_appendf(buf, cap, pos, " v%u, rs1/vs1=%u, funct=0x%x, funct3=0x%x",
                      rd_vd, rs1_vs1, funct, funct3);
       break;
@@ -1239,7 +1350,7 @@ static void xtrace_append_riscv_operands(char *buf, size_t cap, size_t *pos,
     case RISCV_V_LOAD_W:
     case RISCV_V_LOAD_D: {
       unsigned int lumop, rs1, vd;
-      riscv_v_load_b_decode_fields((uint16_t *)pc, &lumop, &rs1, &vd);
+      riscv_v_load_b_decode_fields((uint16_t *)&encoding, &lumop, &rs1, &vd);
       xtrace_appendf(buf, cap, pos, " v%u, (%s), lumop=0x%x",
                      vd, xtrace_riscv_reg(rs1), lumop);
       break;
@@ -1249,7 +1360,7 @@ static void xtrace_append_riscv_operands(char *buf, size_t cap, size_t *pos,
     case RISCV_V_STORE_W:
     case RISCV_V_STORE_D: {
       unsigned int sumop, rs1, vs3;
-      riscv_v_store_b_decode_fields((uint16_t *)pc, &sumop, &rs1, &vs3);
+      riscv_v_store_b_decode_fields((uint16_t *)&encoding, &sumop, &rs1, &vs3);
       xtrace_appendf(buf, cap, pos, " v%u, (%s), sumop=0x%x",
                      vs3, xtrace_riscv_reg(rs1), sumop);
       break;
@@ -1259,14 +1370,14 @@ static void xtrace_append_riscv_operands(char *buf, size_t cap, size_t *pos,
     case RISCV_V_AMO_W:
     case RISCV_V_AMO_D: {
       unsigned int amoop, rs1, vd;
-      riscv_v_amo_b_decode_fields((uint16_t *)pc, &amoop, &rs1, &vd);
+      riscv_v_amo_b_decode_fields((uint16_t *)&encoding, &amoop, &rs1, &vd);
       xtrace_appendf(buf, cap, pos, " v%u, (%s), amoop=0x%x",
                      vd, xtrace_riscv_reg(rs1), amoop);
       break;
     }
     case RISCV_JAL: {
       unsigned int rd, imm;
-      riscv_jal_decode_fields((uint16_t *)pc, &rd, &imm);
+      riscv_jal_decode_fields((uint16_t *)&encoding, &rd, &imm);
       int32_t offset = xtrace_riscv_jal_offset(imm);
       xtrace_appendf(buf, cap, pos, " %s, 0x%" PRIxPTR,
                      xtrace_riscv_reg(rd),
@@ -1275,7 +1386,7 @@ static void xtrace_append_riscv_operands(char *buf, size_t cap, size_t *pos,
     }
     case RISCV_JALR: {
       unsigned int rd, rs1, imm;
-      riscv_jalr_decode_fields((uint16_t *)pc, &rd, &rs1, &imm);
+      riscv_jalr_decode_fields((uint16_t *)&encoding, &rd, &rs1, &imm);
       xtrace_appendf(buf, cap, pos, " %s, %" PRId32 "(%s)",
                      xtrace_riscv_reg(rd), sign_extend32(12, imm),
                      xtrace_riscv_reg(rs1));
@@ -1288,7 +1399,7 @@ static void xtrace_append_riscv_operands(char *buf, size_t cap, size_t *pos,
     case RISCV_BLTU:
     case RISCV_BGEU: {
       unsigned int rs1, rs2, immhi, immlo;
-      riscv_blt_decode_fields((uint16_t *)pc, &rs1, &rs2, &immhi, &immlo);
+      riscv_blt_decode_fields((uint16_t *)&encoding, &rs1, &rs2, &immhi, &immlo);
       int32_t offset = xtrace_riscv_branch_offset(immhi, immlo);
       xtrace_appendf(buf, cap, pos, " %s, %s, 0x%" PRIxPTR,
                      xtrace_riscv_reg(rs1), xtrace_riscv_reg(rs2),
@@ -1297,7 +1408,7 @@ static void xtrace_append_riscv_operands(char *buf, size_t cap, size_t *pos,
     }
     case RISCV_BRANCH: {
       unsigned int funct3, rs1, rs2, immhi, immlo;
-      riscv_branch_decode_fields((uint16_t *)pc, &funct3, &rs1, &rs2,
+      riscv_branch_decode_fields((uint16_t *)&encoding, &funct3, &rs1, &rs2,
                                  &immhi, &immlo);
       int32_t offset = xtrace_riscv_branch_offset(immhi, immlo);
       xtrace_appendf(buf, cap, pos, " cond=%u, %s, %s, 0x%" PRIxPTR,
@@ -1331,26 +1442,171 @@ static void xtrace_format_inst_text(char *buf, size_t cap, size_t *pos,
 
 #ifdef __riscv
   if (inst_type == RISCV_INST) {
-    xtrace_append_riscv_operands(buf, cap, pos, pc, inst);
+    xtrace_append_riscv_operands(buf, cap, pos, pc, encoding, inst);
   }
 #endif
 }
 
-void xtrace_record_inst(uintptr_t pc, uintptr_t encoding, uintptr_t inst_len,
-                        uintptr_t meta) {
+#ifndef XTRACE_DECODER
+static uint8_t xtrace_arch_id(void) {
+#if defined(__aarch64__)
+  return XTRACE_ARCH_AARCH64;
+#elif defined(__arm__)
+  return XTRACE_ARCH_ARM;
+#elif defined(__riscv) && __riscv_xlen == 64
+  return XTRACE_ARCH_RISCV64;
+#else
+  return XTRACE_ARCH_UNKNOWN;
+#endif
+}
+
+static void xtrace_write_file_header(void) {
+  struct xtrace_file_header header = {0};
+  uint16_t endian = 1;
+
+  memcpy(header.magic, XTRACE_FILE_MAGIC, sizeof(header.magic));
+  header.version = XTRACE_FILE_VERSION;
+  header.header_size = sizeof(header);
+  header.event_size = sizeof(struct xtrace_event);
+  header.byte_order = *(uint8_t *)&endian == 1 ? 1 : 2;
+  header.pointer_size = sizeof(uintptr_t);
+  header.arch = xtrace_arch_id();
+  header.flags = (xtrace_timestamp_mode != XTRACE_TIMESTAMP_NONE
+                      ? XTRACE_FILE_FLAG_CLOCK_TIMESTAMPS
+                      : 0) |
+                 (xtrace_has_base_override
+                      ? XTRACE_FILE_FLAG_BASE_OVERRIDE
+                      : 0);
+  header.ring_level = xtrace_ring_level;
+  header.compression_level = (uint32_t)xtrace_compression_level;
+  header.base_override = xtrace_has_base_override ? xtrace_base_override : 0;
+  header.timestamp_frequency_hz =
+      xtrace_timestamp_mode == XTRACE_TIMESTAMP_CLOCK ? xtrace_cpu_hz : 0;
+
+  if (fwrite(&header, sizeof(header), 1, xtrace_file) != 1) {
+    fprintf(stderr, "xtrace: failed to write trace header: %s\n",
+            strerror(errno));
+    xtrace_output_failed = true;
+  } else {
+    xtrace_total_stored_bytes = sizeof(header);
+  }
+}
+
+static void xtrace_flush_thread(struct xtrace_thread *thread) {
+  if (!xtrace_binary || thread->event_count == 0) {
+    return;
+  }
+
+  size_t raw_size = thread->event_count * sizeof(*thread->events);
+  const void *stored = thread->events;
+  size_t stored_size = raw_size;
+  uint32_t flags = 0;
+
+  size_t compressed_size = ZSTD_compressCCtx(
+      thread->compression_ctx, thread->compressed, thread->compressed_capacity,
+      thread->events, raw_size, xtrace_compression_level);
+  if (!ZSTD_isError(compressed_size) && compressed_size < raw_size) {
+    stored = thread->compressed;
+    stored_size = compressed_size;
+    flags = XTRACE_BLOCK_FLAG_ZSTD;
+  }
+
+  struct xtrace_block_header block = {
+      .magic = XTRACE_BLOCK_MAGIC,
+      .header_size = sizeof(block),
+      .thread_id = thread->id,
+      .event_count = thread->event_count,
+      .raw_size = (uint32_t)raw_size,
+      .stored_size = (uint32_t)stored_size,
+      .flags = flags,
+  };
+
+  pthread_mutex_lock(&xtrace_output_lock);
+  if (!xtrace_output_failed &&
+      (fwrite(&block, sizeof(block), 1, xtrace_file) != 1 ||
+       fwrite(stored, stored_size, 1, xtrace_file) != 1)) {
+    fprintf(stderr, "xtrace: trace write failed: %s; disabling output\n",
+            strerror(errno));
+    xtrace_output_failed = true;
+  } else if (!xtrace_output_failed) {
+    xtrace_total_events += thread->event_count;
+    xtrace_total_raw_bytes += raw_size;
+    xtrace_total_stored_bytes += sizeof(block) + stored_size;
+  }
+  pthread_mutex_unlock(&xtrace_output_lock);
+  thread->event_count = 0;
+}
+
+static struct xtrace_event *xtrace_next_event(struct xtrace_thread *thread) {
+  if (thread->event_count == XTRACE_EVENTS_PER_BLOCK) {
+    xtrace_flush_thread(thread);
+  }
+  return &thread->events[thread->event_count++];
+}
+
+static void xtrace_capture_value(struct xtrace_event *event, uintptr_t addr,
+                                 uintptr_t size) {
+  size_t copied = size;
+  if (copied > XTRACE_MAX_BYTE_VALUE) {
+    copied = XTRACE_MAX_BYTE_VALUE;
+    event->flags |= XTRACE_EVENT_FLAG_VALUE_TRUNCATED;
+  }
+  if (copied != 0) {
+    memcpy(&event->data_lo, (void *)addr, copied);
+  }
+}
+
+void xtrace_record_inst(struct xtrace_thread *thread, uintptr_t pc,
+                        uintptr_t encoding, uintptr_t info) {
+  uintptr_t inst_len = info & 0xf;
+  uintptr_t meta = info >> 4;
+
+  if (xtrace_binary) {
+    /* Keep an instruction and its possible load+store records in one block. */
+    if (thread->event_count > XTRACE_EVENTS_PER_BLOCK - 3) {
+      xtrace_flush_thread(thread);
+    }
+    bool timestamp_sample =
+        xtrace_timestamp_mode != XTRACE_TIMESTAMP_NONE &&
+        thread->instruction_count % XTRACE_TIMESTAMP_SAMPLE_INTERVAL == 0;
+    struct xtrace_event *event = xtrace_next_event(thread);
+    *event = (struct xtrace_event){
+        .address = pc,
+        .data_lo = encoding,
+        .data_hi = timestamp_sample ? xtrace_timestamp() : 0,
+        .meta = (uint32_t)meta,
+        .size = (uint16_t)inst_len,
+        .type = XTRACE_EVENT_INST,
+        .flags = timestamp_sample
+                     ? XTRACE_EVENT_FLAG_TIMESTAMP_SAMPLE
+                     : 0,
+    };
+    thread->instruction_count++;
+    return;
+  }
+
   char line[256];
   size_t pos = 0;
   int inst_type = xtrace_meta_inst_type(meta);
   int inst = xtrace_meta_inst(meta);
 
-  xtrace_print_ring_line(pc);
-  xtrace_appendf(line, sizeof(line), &pos, "%" PRIxPTR " @%" PRIu64 ": ",
-                 pc, xtrace_timestamp());
+  bool discontinuity = thread->has_next_pc && pc != thread->next_pc;
+  xtrace_print_ring_line(pc, discontinuity);
+  uint64_t stamp = xtrace_timestamp_mode == XTRACE_TIMESTAMP_NONE
+                       ? 0
+                       : xtrace_timestamp();
+  if (xtrace_timestamp_mode == XTRACE_TIMESTAMP_CLOCK && xtrace_cpu_hz != 0) {
+    stamp = xtrace_scale_timestamp(stamp, xtrace_cpu_hz);
+  }
+  xtrace_appendf(line, sizeof(line), &pos, "%" PRIxPTR " @%" PRIx64 ": ",
+                 pc, stamp);
   xtrace_format_bytes(line, sizeof(line), &pos, encoding, inst_len);
   xtrace_appendf(line, sizeof(line), &pos, "  ");
   xtrace_format_inst_text(line, sizeof(line), &pos, pc, encoding,
                           inst_type, inst);
   xtrace_appendf(line, sizeof(line), &pos, "\n");
+  thread->next_pc = pc + inst_len;
+  thread->has_next_pc = true;
   fputs(line, xtrace_file);
 }
 
@@ -1360,10 +1616,21 @@ void xtrace_record_access_pre(struct xtrace_thread *thread, uintptr_t pc,
   uintptr_t size = info >> XTRACE_INFO_SIZE_SHIFT;
 
   if (info & XTRACE_INFO_LOAD) {
-    fprintf(xtrace_file, " - LD %" PRIuPTR " M[%" PRIxPTR "] -> ",
-            size * 8, addr);
-    xtrace_print_mem_value(addr, size);
-    fprintf(xtrace_file, "\n");
+    if (xtrace_binary) {
+      struct xtrace_event *event = xtrace_next_event(thread);
+      *event = (struct xtrace_event){
+          .address = addr,
+          .meta = size > UINT32_MAX ? UINT32_MAX : (uint32_t)size,
+          .size = size > UINT16_MAX ? UINT16_MAX : (uint16_t)size,
+          .type = XTRACE_EVENT_LOAD,
+      };
+      xtrace_capture_value(event, addr, size);
+    } else {
+      fprintf(xtrace_file, " - LD %" PRIuPTR " M[%" PRIxPTR "] -> ",
+              size * 8, addr);
+      xtrace_print_mem_value(addr, size);
+      fprintf(xtrace_file, "\n");
+    }
   }
 
   if (info & XTRACE_INFO_STORE) {
@@ -1379,10 +1646,21 @@ void xtrace_record_store_post(struct xtrace_thread *thread) {
   }
 
   uintptr_t size = thread->store_info >> XTRACE_INFO_SIZE_SHIFT;
-  fprintf(xtrace_file, " - ST %" PRIuPTR " M[%" PRIxPTR "] <- ",
-          size * 8, thread->store_addr);
-  xtrace_print_mem_value(thread->store_addr, size);
-  fprintf(xtrace_file, "\n");
+  if (xtrace_binary) {
+    struct xtrace_event *event = xtrace_next_event(thread);
+    *event = (struct xtrace_event){
+        .address = thread->store_addr,
+        .meta = size > UINT32_MAX ? UINT32_MAX : (uint32_t)size,
+        .size = size > UINT16_MAX ? UINT16_MAX : (uint16_t)size,
+        .type = XTRACE_EVENT_STORE,
+    };
+    xtrace_capture_value(event, thread->store_addr, size);
+  } else {
+    fprintf(xtrace_file, " - ST %" PRIuPTR " M[%" PRIxPTR "] <- ",
+            size * 8, thread->store_addr);
+    xtrace_print_mem_value(thread->store_addr, size);
+    fprintf(xtrace_file, "\n");
+  }
 
   thread->store_pending = false;
 }
@@ -1408,19 +1686,19 @@ int xtrace_pre_inst_handler(mambo_context *ctx) {
 
 #ifdef __riscv
   emit_push(ctx, (1 << a0) | (1 << a1) | (1 << a2) | (1 << a3) | (1 << lr));
-  emit_set_reg_ptr(ctx, a0, (void *)xtrace_source_addr(ctx));
-  emit_set_reg(ctx, a1, xtrace_inst_encoding(ctx));
-  emit_set_reg(ctx, a2, mambo_get_inst_len(ctx));
-  emit_set_reg(ctx, a3, xtrace_inst_meta(ctx));
+  emit_set_reg_ptr(ctx, a0, mambo_get_thread_plugin_data(ctx));
+  emit_set_reg_ptr(ctx, a1, (void *)xtrace_source_addr(ctx));
+  emit_set_reg(ctx, a2, xtrace_inst_encoding(ctx));
+  emit_set_reg(ctx, a3, xtrace_inst_info(ctx));
   ret = emit_safe_fcall(ctx, xtrace_record_inst, 4);
   assert(ret == 0);
   emit_pop(ctx, (1 << a0) | (1 << a1) | (1 << a2) | (1 << a3) | (1 << lr));
 #else
   emit_push(ctx, (1 << 0) | (1 << 1) | (1 << 2) | (1 << 3) | (1 << lr));
-  emit_set_reg_ptr(ctx, 0, (void *)xtrace_source_addr(ctx));
-  emit_set_reg(ctx, 1, xtrace_inst_encoding(ctx));
-  emit_set_reg(ctx, 2, mambo_get_inst_len(ctx));
-  emit_set_reg(ctx, 3, xtrace_inst_meta(ctx));
+  emit_set_reg_ptr(ctx, 0, mambo_get_thread_plugin_data(ctx));
+  emit_set_reg_ptr(ctx, 1, (void *)xtrace_source_addr(ctx));
+  emit_set_reg(ctx, 2, xtrace_inst_encoding(ctx));
+  emit_set_reg(ctx, 3, xtrace_inst_info(ctx));
   ret = emit_safe_fcall(ctx, xtrace_record_inst, 4);
   assert(ret == 0);
   emit_pop(ctx, (1 << 0) | (1 << 1) | (1 << 2) | (1 << 3) | (1 << lr));
@@ -1529,7 +1807,24 @@ int xtrace_pre_thread_handler(mambo_context *ctx) {
   struct xtrace_thread *thread = mambo_alloc(ctx, sizeof(*thread));
   assert(thread != NULL);
 
+  memset(thread, 0, sizeof(*thread));
+  thread->id = __atomic_fetch_add(&xtrace_next_thread_id, 1,
+                                  __ATOMIC_RELAXED);
   thread->store_pending = false;
+
+  if (xtrace_binary) {
+    size_t raw_capacity = XTRACE_EVENTS_PER_BLOCK *
+                          sizeof(struct xtrace_event);
+    thread->events = malloc(raw_capacity);
+    thread->compressed_capacity = ZSTD_compressBound(raw_capacity);
+    thread->compressed = malloc(thread->compressed_capacity);
+    thread->compression_ctx = ZSTD_createCCtx();
+    if (thread->events == NULL || thread->compressed == NULL ||
+        thread->compression_ctx == NULL) {
+      fprintf(stderr, "xtrace: failed to allocate a thread trace buffer\n");
+      abort();
+    }
+  }
 
   int ret = mambo_set_thread_plugin_data(ctx, thread);
   assert(ret == MAMBO_SUCCESS);
@@ -1539,6 +1834,10 @@ int xtrace_pre_thread_handler(mambo_context *ctx) {
 
 int xtrace_post_thread_handler(mambo_context *ctx) {
   struct xtrace_thread *thread = mambo_get_thread_plugin_data(ctx);
+  xtrace_flush_thread(thread);
+  ZSTD_freeCCtx(thread->compression_ctx);
+  free(thread->events);
+  free(thread->compressed);
   mambo_free(ctx, thread);
 
   return 0;
@@ -1546,8 +1845,38 @@ int xtrace_post_thread_handler(mambo_context *ctx) {
 
 int xtrace_exit_handler(mambo_context *ctx) {
   (void)ctx;
-  fprintf(xtrace_file, "#eof\n");
-  fflush(xtrace_file);
+  if (xtrace_binary) {
+    struct xtrace_block_header eof = {
+        .magic = XTRACE_EOF_MAGIC,
+        .header_size = sizeof(eof),
+    };
+    if (!xtrace_output_failed) {
+      if (fwrite(&eof, sizeof(eof), 1, xtrace_file) == 1) {
+        xtrace_total_stored_bytes += sizeof(eof);
+      } else {
+        fprintf(stderr, "xtrace: failed to write EOF block: %s\n",
+                strerror(errno));
+        xtrace_output_failed = true;
+      }
+    }
+  } else {
+    fprintf(xtrace_file, "#eof\n");
+  }
+  if (fflush(xtrace_file) != 0) {
+    fprintf(stderr, "xtrace: failed to flush trace output: %s\n",
+            strerror(errno));
+    xtrace_output_failed = true;
+  }
+
+  if (xtrace_binary && xtrace_total_raw_bytes != 0) {
+    fprintf(stderr,
+            "xtrace: %" PRIu64 " events, %" PRIu64
+            " raw bytes, %" PRIu64 " stored bytes (%.2fx)%s\n",
+            xtrace_total_events, xtrace_total_raw_bytes,
+            xtrace_total_stored_bytes,
+            (double)xtrace_total_raw_bytes / xtrace_total_stored_bytes,
+            xtrace_output_failed ? ", output incomplete" : "");
+  }
 
   if (xtrace_close_file) {
     fclose(xtrace_file);
@@ -1562,6 +1891,9 @@ __attribute__((constructor)) void xtrace_init_plugin(void) {
   xtrace_parse_config();
   xtrace_start_stamp = xtrace_read_stamp();
   xtrace_open_file();
+  if (xtrace_binary) {
+    xtrace_write_file_header();
+  }
 
   mambo_register_pre_thread_cb(ctx, &xtrace_pre_thread_handler);
   mambo_register_post_thread_cb(ctx, &xtrace_post_thread_handler);
@@ -1569,5 +1901,304 @@ __attribute__((constructor)) void xtrace_init_plugin(void) {
   mambo_register_post_inst_cb(ctx, &xtrace_post_inst_handler);
   mambo_register_exit_cb(ctx, &xtrace_exit_handler);
 }
+
+#endif /* !XTRACE_DECODER */
+
+#ifdef XTRACE_DECODER
+static uint8_t xtrace_decoder_arch(void) {
+#if defined(__aarch64__)
+  return XTRACE_ARCH_AARCH64;
+#elif defined(__arm__)
+  return XTRACE_ARCH_ARM;
+#elif defined(__riscv) && __riscv_xlen == 64
+  return XTRACE_ARCH_RISCV64;
+#else
+  return XTRACE_ARCH_UNKNOWN;
+#endif
+}
+
+static int xtrace_decoder_value(FILE *out, const struct xtrace_event *event) {
+  uintptr_t size = event->meta;
+  if (size == 0) {
+    return fprintf(out, "?") < 0 ? -1 : 0;
+  }
+
+  if (size <= sizeof(uint64_t)) {
+    uint64_t value = event->data_lo;
+    if (size < sizeof(value)) {
+      value &= (1ull << (size * 8)) - 1;
+    }
+    return fprintf(out, "%" PRIx64, value) < 0 ? -1 : 0;
+  }
+
+  const unsigned char *bytes = (const unsigned char *)&event->data_lo;
+  size_t count = size > XTRACE_MAX_BYTE_VALUE
+                     ? XTRACE_MAX_BYTE_VALUE
+                     : (size_t)size;
+  for (size_t i = 0; i < count; i++) {
+    if (fprintf(out, "%02x", bytes[i]) < 0) {
+      return -1;
+    }
+  }
+  if ((event->flags & XTRACE_EVENT_FLAG_VALUE_TRUNCATED) != 0) {
+    return fprintf(out, "...") < 0 ? -1 : 0;
+  }
+  return 0;
+}
+
+struct xtrace_decode_thread {
+  uint64_t sampled_stamp;
+  uint64_t next_pc;
+  bool has_sampled_stamp;
+  bool has_next_pc;
+};
+
+static int xtrace_decode_event(FILE *out,
+                               const struct xtrace_file_header *header,
+                               const struct xtrace_event *event,
+                               struct xtrace_decode_thread *thread,
+                               bool *ring_written) {
+  if (event->type == XTRACE_EVENT_INST) {
+    char line[256];
+    size_t pos = 0;
+    uintptr_t meta = event->meta;
+    uint64_t stamp;
+
+    bool first_ring = !*ring_written;
+    bool discontinuity = thread->has_next_pc &&
+                         event->address != thread->next_pc;
+    if (first_ring || discontinuity) {
+      uint64_t target = first_ring &&
+                                (header->flags &
+                                 XTRACE_FILE_FLAG_BASE_OVERRIDE) != 0
+                            ? header->base_override
+                            : event->address;
+      if (fprintf(out, "ring %d, pc -> %" PRIx64 "\n",
+                  header->ring_level, target) < 0) {
+        return -1;
+      }
+      *ring_written = true;
+    }
+
+    if ((header->flags & XTRACE_FILE_FLAG_CYCLE_TIMESTAMPS) != 0) {
+      stamp = event->data_hi;
+    } else if ((header->flags & XTRACE_FILE_FLAG_CLOCK_TIMESTAMPS) != 0) {
+      if ((event->flags & XTRACE_EVENT_FLAG_TIMESTAMP_SAMPLE) != 0) {
+        thread->sampled_stamp = event->data_hi;
+        thread->has_sampled_stamp = true;
+      }
+      if (!thread->has_sampled_stamp) {
+        fprintf(stderr,
+                "xtrace-decode: instruction stream starts without a "
+                "timestamp sample\n");
+        return -1;
+      }
+      stamp = thread->sampled_stamp;
+      if (header->timestamp_frequency_hz != 0) {
+        stamp = xtrace_scale_timestamp(stamp,
+                                       header->timestamp_frequency_hz);
+      }
+    } else {
+      stamp = 0;
+    }
+
+    xtrace_appendf(line, sizeof(line), &pos, "%" PRIx64 " @%" PRIx64 ": ",
+                   event->address, stamp);
+    xtrace_format_bytes(line, sizeof(line), &pos, event->data_lo,
+                        event->size);
+    xtrace_appendf(line, sizeof(line), &pos, "  ");
+    xtrace_format_inst_text(line, sizeof(line), &pos, event->address,
+                            event->data_lo, xtrace_meta_inst_type(meta),
+                            xtrace_meta_inst(meta));
+    xtrace_appendf(line, sizeof(line), &pos, "\n");
+    thread->next_pc = event->address + event->size;
+    thread->has_next_pc = true;
+    return fputs(line, out) == EOF ? -1 : 0;
+  }
+
+  if (event->type != XTRACE_EVENT_LOAD &&
+      event->type != XTRACE_EVENT_STORE) {
+    fprintf(stderr, "xtrace-decode: unknown event type %u\n", event->type);
+    return -1;
+  }
+
+  const char *kind = event->type == XTRACE_EVENT_LOAD ? "LD" : "ST";
+  const char *arrow = event->type == XTRACE_EVENT_LOAD ? "->" : "<-";
+  if (fprintf(out, " - %s %" PRIu64 " M[%" PRIx64 "] %s ",
+              kind, (uint64_t)event->meta * 8, event->address, arrow) < 0 ||
+      xtrace_decoder_value(out, event) != 0 || fputc('\n', out) == EOF) {
+    return -1;
+  }
+  return 0;
+}
+
+static int xtrace_decode_stream(FILE *input, FILE *output) {
+  struct xtrace_file_header header;
+  uint16_t endian = 1;
+  bool ring_written = false;
+  struct xtrace_decode_thread *threads = NULL;
+  size_t thread_count = 0;
+  int result = 1;
+
+  if (fread(&header, sizeof(header), 1, input) != 1) {
+    fprintf(stderr, "xtrace-decode: cannot read trace header\n");
+    goto done;
+  }
+  if (memcmp(header.magic, XTRACE_FILE_MAGIC, sizeof(header.magic)) != 0 ||
+      header.version != XTRACE_FILE_VERSION ||
+      header.header_size != sizeof(header) ||
+      header.event_size != sizeof(struct xtrace_event) ||
+      header.pointer_size != sizeof(uintptr_t) ||
+      (header.flags & ~(XTRACE_FILE_FLAG_CLOCK_TIMESTAMPS |
+                        XTRACE_FILE_FLAG_BASE_OVERRIDE |
+                        XTRACE_FILE_FLAG_CYCLE_TIMESTAMPS)) != 0 ||
+      (header.flags & (XTRACE_FILE_FLAG_CLOCK_TIMESTAMPS |
+                       XTRACE_FILE_FLAG_CYCLE_TIMESTAMPS)) ==
+          (XTRACE_FILE_FLAG_CLOCK_TIMESTAMPS |
+           XTRACE_FILE_FLAG_CYCLE_TIMESTAMPS) ||
+      (header.timestamp_frequency_hz != 0 &&
+       (header.flags & XTRACE_FILE_FLAG_CLOCK_TIMESTAMPS) == 0)) {
+    fprintf(stderr, "xtrace-decode: unsupported or corrupt trace format\n");
+    goto done;
+  }
+  if (header.byte_order != (*(uint8_t *)&endian == 1 ? 1 : 2)) {
+    fprintf(stderr, "xtrace-decode: cross-endian decoding is not supported\n");
+    goto done;
+  }
+  uint8_t decoder_arch = xtrace_decoder_arch();
+  if (decoder_arch != XTRACE_ARCH_UNKNOWN && decoder_arch != header.arch) {
+    fprintf(stderr,
+            "xtrace-decode: trace architecture %u does not match decoder %u\n",
+            header.arch, decoder_arch);
+    goto done;
+  }
+
+  for (;;) {
+    struct xtrace_block_header block;
+    if (fread(&block, sizeof(block), 1, input) != 1) {
+      fprintf(stderr, "xtrace-decode: truncated trace (missing EOF block)\n");
+      goto done;
+    }
+    if (block.magic == XTRACE_EOF_MAGIC) {
+      if (block.header_size != sizeof(block)) {
+        fprintf(stderr, "xtrace-decode: corrupt EOF block\n");
+        goto done;
+      }
+      break;
+    }
+    if (block.magic != XTRACE_BLOCK_MAGIC ||
+        block.header_size != sizeof(block) ||
+        block.event_count > XTRACE_EVENTS_PER_BLOCK ||
+        block.thread_id > (1u << 20) ||
+        block.raw_size != block.event_count * sizeof(struct xtrace_event) ||
+        block.stored_size == 0 || block.stored_size > block.raw_size ||
+        (block.flags & ~XTRACE_BLOCK_FLAG_ZSTD) != 0) {
+      fprintf(stderr, "xtrace-decode: corrupt block header\n");
+      goto done;
+    }
+
+    void *stored = malloc(block.stored_size);
+    struct xtrace_event *events = malloc(block.raw_size);
+    if (stored == NULL || events == NULL) {
+      fprintf(stderr, "xtrace-decode: out of memory\n");
+      free(stored);
+      free(events);
+      goto done;
+    }
+    if (fread(stored, block.stored_size, 1, input) != 1) {
+      fprintf(stderr, "xtrace-decode: truncated event block\n");
+      free(stored);
+      free(events);
+      goto done;
+    }
+
+    bool compressed = (block.flags & XTRACE_BLOCK_FLAG_ZSTD) != 0;
+    if (compressed) {
+      size_t decoded = ZSTD_decompress(events, block.raw_size, stored,
+                                       block.stored_size);
+      if (ZSTD_isError(decoded) || decoded != block.raw_size) {
+        fprintf(stderr, "xtrace-decode: invalid zstd block\n");
+        free(stored);
+        free(events);
+        goto done;
+      }
+    } else if (block.stored_size == block.raw_size) {
+      memcpy(events, stored, block.raw_size);
+    } else {
+      fprintf(stderr, "xtrace-decode: block has unknown compression flags\n");
+      free(stored);
+      free(events);
+      goto done;
+    }
+    free(stored);
+
+    if (block.thread_id >= thread_count) {
+      size_t new_count = (size_t)block.thread_id + 1;
+      struct xtrace_decode_thread *new_threads =
+          realloc(threads, new_count * sizeof(*new_threads));
+      if (new_threads == NULL) {
+        fprintf(stderr, "xtrace-decode: out of memory\n");
+        free(events);
+        goto done;
+      }
+      memset(new_threads + thread_count, 0,
+             (new_count - thread_count) * sizeof(*new_threads));
+      threads = new_threads;
+      thread_count = new_count;
+    }
+
+    for (uint32_t i = 0; i < block.event_count; i++) {
+      if (xtrace_decode_event(output, &header, &events[i],
+                              &threads[block.thread_id],
+                              &ring_written) != 0) {
+        fprintf(stderr, "xtrace-decode: output write failed: %s\n",
+                strerror(errno));
+        free(events);
+        goto done;
+      }
+    }
+    free(events);
+  }
+
+  if (fputs("#eof\n", output) == EOF || fflush(output) != 0) {
+    fprintf(stderr, "xtrace-decode: output write failed: %s\n",
+            strerror(errno));
+    goto done;
+  }
+  result = 0;
+
+done:
+  free(threads);
+  return result;
+}
+
+int main(int argc, char **argv) {
+  if (argc < 2 || argc > 3) {
+    fprintf(stderr, "usage: %s INPUT.xtr [OUTPUT.txt]\n", argv[0]);
+    return 2;
+  }
+
+  FILE *input = strcmp(argv[1], "-") == 0 ? stdin : fopen(argv[1], "rb");
+  if (input == NULL) {
+    fprintf(stderr, "xtrace-decode: cannot open %s: %s\n", argv[1],
+            strerror(errno));
+    return 1;
+  }
+  FILE *output = argc == 3 ? fopen(argv[2], "w") : stdout;
+  if (output == NULL) {
+    fprintf(stderr, "xtrace-decode: cannot open %s: %s\n", argv[2],
+            strerror(errno));
+    if (input != stdin) fclose(input);
+    return 1;
+  }
+  setvbuf(input, NULL, _IOFBF, 1 << 20);
+  setvbuf(output, NULL, _IOFBF, 1 << 20);
+
+  int result = xtrace_decode_stream(input, output);
+  if (input != stdin) fclose(input);
+  if (output != stdout && fclose(output) != 0) result = 1;
+  return result;
+}
+#endif /* XTRACE_DECODER */
 
 #endif
