@@ -388,9 +388,325 @@ static const char *xtrace_riscv_reg(unsigned int reg) {
   return reg < 32 ? names[reg] : "x?";
 }
 
+static const char *xtrace_riscv_freg(unsigned int reg) {
+  static const char *const names[] = {
+    "ft0", "ft1", "ft2", "ft3", "ft4", "ft5", "ft6", "ft7",
+    "fs0", "fs1", "fa0", "fa1", "fa2", "fa3", "fa4", "fa5",
+    "fa6", "fa7", "fs2", "fs3", "fs4", "fs5", "fs6", "fs7",
+    "fs8", "fs9", "fs10", "fs11", "ft8", "ft9", "ft10", "ft11"
+  };
+  return reg < 32 ? names[reg] : "f?";
+}
+
+static const char *xtrace_riscv_rm(unsigned int rm) {
+  static const char *const names[] = {
+    "rne", "rtz", "rdn", "rup", "rmm", "rm5", "rm6", "dyn"
+  };
+  return rm < 8 ? names[rm] : "rm?";
+}
+
+static void xtrace_append_riscv_aqrl(char *buf, size_t cap, size_t *pos,
+                                     unsigned int aq, unsigned int rl) {
+  if (aq != 0 && rl != 0) {
+    xtrace_appendf(buf, cap, pos, ".aqrl");
+  } else if (aq != 0) {
+    xtrace_appendf(buf, cap, pos, ".aq");
+  } else if (rl != 0) {
+    xtrace_appendf(buf, cap, pos, ".rl");
+  }
+}
+
+static void xtrace_append_riscv_fence_set(char *buf, size_t cap, size_t *pos,
+                                          unsigned int bits) {
+  static const char names[] = "iorw";
+  bool any = false;
+
+  for (unsigned int i = 0; i < 4; i++) {
+    unsigned int bit = 1u << (3 - i);
+    if ((bits & bit) != 0) {
+      xtrace_appendf(buf, cap, pos, "%c", names[i]);
+      any = true;
+    }
+  }
+  if (!any) {
+    xtrace_appendf(buf, cap, pos, "0");
+  }
+}
+
+static unsigned int xtrace_riscv_c_addi4spn_imm(unsigned int nzuimm) {
+  return (((nzuimm >> 6) & 0x3) << 4) |
+         (((nzuimm >> 2) & 0xf) << 6) |
+         (((nzuimm >> 1) & 0x1) << 2) |
+         ((nzuimm & 0x1) << 3);
+}
+
+static int32_t xtrace_riscv_c_addi16sp_imm(unsigned int immhi,
+                                           unsigned int immlo) {
+  uint32_t immediate = ((immhi & 0x1) << 9) |
+                       (((immlo >> 4) & 0x1) << 4) |
+                       (((immlo >> 3) & 0x1) << 6) |
+                       (((immlo >> 1) & 0x3) << 7) |
+                       ((immlo & 0x1) << 5);
+  return sign_extend32(10, immediate);
+}
+
+static unsigned int xtrace_riscv_c_word_offset(unsigned int uimmhi,
+                                               unsigned int uimmlo) {
+  return (uimmhi << 3) | ((uimmlo & 0x1) << 6) | ((uimmlo & 0x2) << 1);
+}
+
+static unsigned int xtrace_riscv_c_doubleword_offset(unsigned int uimmhi,
+                                                     unsigned int uimmlo) {
+  return (uimmhi << 3) | (uimmlo << 6);
+}
+
+static unsigned int xtrace_riscv_c_spword_load_offset(unsigned int uimmhi,
+                                                      unsigned int uimmlo) {
+  return (uimmhi << 5) | ((uimmlo & 0x3) << 6) | (uimmlo & 0x1c);
+}
+
+static unsigned int xtrace_riscv_c_spdoubleword_load_offset(unsigned int uimmhi,
+                                                            unsigned int uimmlo) {
+  return (uimmhi << 5) | ((uimmlo & 0x7) << 6) | (uimmlo & 0x18);
+}
+
+static unsigned int xtrace_riscv_c_spword_store_offset(unsigned int uimm) {
+  return ((uimm & 0x3) << 6) | (uimm & 0x1c);
+}
+
+static unsigned int xtrace_riscv_c_spdoubleword_store_offset(unsigned int uimm) {
+  return ((uimm & 0x7) << 6) | (uimm & 0x18);
+}
+
+static int32_t xtrace_riscv_store_offset(unsigned int immhi,
+                                         unsigned int immlo) {
+  return sign_extend32(12, (immhi << 5) | immlo);
+}
+
+static int32_t xtrace_riscv_branch_offset(unsigned int immhi,
+                                          unsigned int immlo) {
+  uint32_t immediate = (extr(4, 1, immlo) << 1) |
+                       (extr(6, 0, immhi) << 5) |
+                       (extr(1, 0, immlo) << 11) |
+                       (extr(1, 6, immhi) << 12);
+  return sign_extend32(13, immediate);
+}
+
+static int32_t xtrace_riscv_c_branch_offset(unsigned int immhi,
+                                            unsigned int immlo) {
+  uint32_t offset = (extr(2, 1, immlo) << 1) |
+                    (extr(2, 0, immhi) << 3) |
+                    (extr(1, 0, immlo) << 5) |
+                    (extr(2, 3, immlo) << 6) |
+                    (extr(1, 2, immhi) << 8);
+  return sign_extend32(9, offset);
+}
+
+static int32_t xtrace_riscv_jal_offset(unsigned int imm) {
+  uint32_t immediate = (extr(10, 9, imm) << 1) |
+                       (extr(1, 8, imm) << 11) |
+                       (extr(8, 0, imm) << 12) |
+                       (extr(1, 19, imm) << 20);
+  return sign_extend32(21, immediate);
+}
+
+static int32_t xtrace_riscv_c_j_offset(unsigned int imm) {
+  uint32_t offset = (extr(3, 1, imm) << 1) |
+                    (extr(1, 9, imm) << 4) |
+                    (extr(1, 0, imm) << 5) |
+                    (extr(1, 5, imm) << 6) |
+                    (extr(1, 4, imm) << 7) |
+                    (extr(2, 7, imm) << 8) |
+                    (extr(1, 6, imm) << 10) |
+                    (extr(1, 10, imm) << 11);
+  return sign_extend32(12, offset);
+}
+
+static int32_t xtrace_riscv_c_imm(unsigned int immhi, unsigned int immlo) {
+  return sign_extend32(6, (immhi << 5) | immlo);
+}
+
 static void xtrace_append_riscv_operands(char *buf, size_t cap, size_t *pos,
                                          uintptr_t pc, int inst) {
   switch ((riscv_instruction)inst) {
+    case RISCV_C_ADDI4SPN: {
+      unsigned int rd, nzuimm;
+      riscv_c_addi4spn_decode_fields((uint16_t *)pc, &rd, &nzuimm);
+      xtrace_appendf(buf, cap, pos, " %s, sp, %u",
+                     xtrace_riscv_reg(rd + s0),
+                     xtrace_riscv_c_addi4spn_imm(nzuimm));
+      break;
+    }
+    case RISCV_C_FLD:
+    case RISCV_C_LW:
+    case RISCV_C_LD: {
+      unsigned int rd, rs1, uimmhi, uimmlo;
+      riscv_c_lw_decode_fields((uint16_t *)pc, &rd, &rs1, &uimmhi, &uimmlo);
+      unsigned int offset = inst == RISCV_C_LW
+                              ? xtrace_riscv_c_word_offset(uimmhi, uimmlo)
+                              : xtrace_riscv_c_doubleword_offset(uimmhi, uimmlo);
+      if (inst == RISCV_C_FLD) {
+        xtrace_appendf(buf, cap, pos, " %s, %u(%s)",
+                       xtrace_riscv_freg(rd + s0), offset,
+                       xtrace_riscv_reg(rs1 + s0));
+      } else {
+        xtrace_appendf(buf, cap, pos, " %s, %u(%s)",
+                       xtrace_riscv_reg(rd + s0), offset,
+                       xtrace_riscv_reg(rs1 + s0));
+      }
+      break;
+    }
+    case RISCV_C_FSD:
+    case RISCV_C_SW:
+    case RISCV_C_SD: {
+      unsigned int rs2, rs1, uimmhi, uimmlo;
+      riscv_c_sw_decode_fields((uint16_t *)pc, &rs2, &rs1, &uimmhi, &uimmlo);
+      unsigned int offset = inst == RISCV_C_SW
+                              ? xtrace_riscv_c_word_offset(uimmhi, uimmlo)
+                              : xtrace_riscv_c_doubleword_offset(uimmhi, uimmlo);
+      if (inst == RISCV_C_FSD) {
+        xtrace_appendf(buf, cap, pos, " %s, %u(%s)",
+                       xtrace_riscv_freg(rs2 + s0), offset,
+                       xtrace_riscv_reg(rs1 + s0));
+      } else {
+        xtrace_appendf(buf, cap, pos, " %s, %u(%s)",
+                       xtrace_riscv_reg(rs2 + s0), offset,
+                       xtrace_riscv_reg(rs1 + s0));
+      }
+      break;
+    }
+    case RISCV_C_FLWSP:
+    case RISCV_C_FLDSP:
+    case RISCV_C_LWSP:
+    case RISCV_C_LDSP: {
+      unsigned int rd, uimmhi, uimmlo;
+      riscv_c_lwsp_decode_fields((uint16_t *)pc, &rd, &uimmhi, &uimmlo);
+      unsigned int offset = (inst == RISCV_C_LWSP || inst == RISCV_C_FLWSP)
+                              ? xtrace_riscv_c_spword_load_offset(uimmhi, uimmlo)
+                              : xtrace_riscv_c_spdoubleword_load_offset(uimmhi, uimmlo);
+      if (inst == RISCV_C_FLWSP || inst == RISCV_C_FLDSP) {
+        xtrace_appendf(buf, cap, pos, " %s, %u(sp)",
+                       xtrace_riscv_freg(rd), offset);
+      } else {
+        xtrace_appendf(buf, cap, pos, " %s, %u(sp)",
+                       xtrace_riscv_reg(rd), offset);
+      }
+      break;
+    }
+    case RISCV_C_FSDSP:
+    case RISCV_C_SWSP:
+    case RISCV_C_SDSP: {
+      unsigned int rs2, uimm;
+      riscv_c_swsp_decode_fields((uint16_t *)pc, &rs2, &uimm);
+      unsigned int offset = inst == RISCV_C_SWSP
+                              ? xtrace_riscv_c_spword_store_offset(uimm)
+                              : xtrace_riscv_c_spdoubleword_store_offset(uimm);
+      if (inst == RISCV_C_FSDSP) {
+        xtrace_appendf(buf, cap, pos, " %s, %u(sp)",
+                       xtrace_riscv_freg(rs2), offset);
+      } else {
+        xtrace_appendf(buf, cap, pos, " %s, %u(sp)",
+                       xtrace_riscv_reg(rs2), offset);
+      }
+      break;
+    }
+    case RISCV_C_ADDI:
+    case RISCV_C_ADDIW:
+    case RISCV_C_LI: {
+      unsigned int rd, immhi, immlo;
+      riscv_c_addi_decode_fields((uint16_t *)pc, &rd, &immhi, &immlo);
+      xtrace_appendf(buf, cap, pos, " %s, %" PRId32,
+                     xtrace_riscv_reg(rd),
+                     xtrace_riscv_c_imm(immhi, immlo));
+      break;
+    }
+    case RISCV_C_ADDI16SP: {
+      unsigned int immhi, immlo;
+      riscv_c_addi16sp_decode_fields((uint16_t *)pc, &immhi, &immlo);
+      xtrace_appendf(buf, cap, pos, " sp, %" PRId32,
+                     xtrace_riscv_c_addi16sp_imm(immhi, immlo));
+      break;
+    }
+    case RISCV_C_LUI: {
+      unsigned int rd, immhi, immlo;
+      riscv_c_lui_decode_fields((uint16_t *)pc, &rd, &immhi, &immlo);
+      int32_t imm = sign_extend32(18, ((immhi << 5) | immlo) << 12);
+      xtrace_appendf(buf, cap, pos, " %s, %" PRId32,
+                     xtrace_riscv_reg(rd), imm);
+      break;
+    }
+    case RISCV_C_SLLI: {
+      unsigned int rs1_rd, shhi, shlo;
+      riscv_c_slli_decode_fields((uint16_t *)pc, &rs1_rd, &shhi, &shlo);
+      xtrace_appendf(buf, cap, pos, " %s, %u",
+                     xtrace_riscv_reg(rs1_rd),
+                     (shhi << 5) | shlo);
+      break;
+    }
+    case RISCV_C_SRLI:
+    case RISCV_C_SRAI: {
+      unsigned int rs1_rd, shhi, shlo;
+      riscv_c_slli_decode_fields((uint16_t *)pc, &rs1_rd, &shhi, &shlo);
+      xtrace_appendf(buf, cap, pos, " %s, %u",
+                     xtrace_riscv_reg(rs1_rd + s0),
+                     (shhi << 5) | shlo);
+      break;
+    }
+    case RISCV_C_ANDI: {
+      unsigned int rs1_rd, immhi, immlo;
+      riscv_c_andi_decode_fields((uint16_t *)pc, &rs1_rd, &immhi, &immlo);
+      xtrace_appendf(buf, cap, pos, " %s, %" PRId32,
+                     xtrace_riscv_reg(rs1_rd + s0),
+                     xtrace_riscv_c_imm(immhi, immlo));
+      break;
+    }
+    case RISCV_C_SUB:
+    case RISCV_C_XOR:
+    case RISCV_C_OR:
+    case RISCV_C_AND:
+    case RISCV_C_SUBW:
+    case RISCV_C_ADDW: {
+      unsigned int rs1_rd, rs2;
+      riscv_c_sub_decode_fields((uint16_t *)pc, &rs1_rd, &rs2);
+      xtrace_appendf(buf, cap, pos, " %s, %s",
+                     xtrace_riscv_reg(rs1_rd + s0),
+                     xtrace_riscv_reg(rs2 + s0));
+      break;
+    }
+    case RISCV_C_MV:
+    case RISCV_C_ADD: {
+      unsigned int rd, rs2;
+      riscv_c_add_decode_fields((uint16_t *)pc, &rd, &rs2);
+      xtrace_appendf(buf, cap, pos, " %s, %s",
+                     xtrace_riscv_reg(rd), xtrace_riscv_reg(rs2));
+      break;
+    }
+    case RISCV_C_JR:
+    case RISCV_C_JALR: {
+      unsigned int rs1;
+      riscv_c_jr_decode_fields((uint16_t *)pc, &rs1);
+      xtrace_appendf(buf, cap, pos, " %s", xtrace_riscv_reg(rs1));
+      break;
+    }
+    case RISCV_C_J:
+    case RISCV_C_JAL: {
+      unsigned int imm;
+      riscv_c_j_decode_fields((uint16_t *)pc, &imm);
+      int32_t offset = xtrace_riscv_c_j_offset(imm);
+      xtrace_appendf(buf, cap, pos, " 0x%" PRIxPTR,
+                     (uintptr_t)((intptr_t)pc + offset));
+      break;
+    }
+    case RISCV_C_BEQZ:
+    case RISCV_C_BNEZ: {
+      unsigned int rs1, immhi, immlo;
+      riscv_c_beqz_decode_fields((uint16_t *)pc, &rs1, &immhi, &immlo);
+      int32_t offset = xtrace_riscv_c_branch_offset(immhi, immlo);
+      xtrace_appendf(buf, cap, pos, " %s, 0x%" PRIxPTR,
+                     xtrace_riscv_reg(rs1 + s0),
+                     (uintptr_t)((intptr_t)pc + offset));
+      break;
+    }
     case RISCV_LB:
     case RISCV_LH:
     case RISCV_LW:
@@ -405,15 +721,577 @@ static void xtrace_append_riscv_operands(char *buf, size_t cap, size_t *pos,
                      xtrace_riscv_reg(rs1));
       break;
     }
+    case RISCV_FLW:
+    case RISCV_FLD: {
+      unsigned int rd, rs1, imm;
+      riscv_flw_decode_fields((uint16_t *)pc, &rd, &rs1, &imm);
+      xtrace_appendf(buf, cap, pos, " %s, %" PRId32 "(%s)",
+                     xtrace_riscv_freg(rd), sign_extend32(12, imm),
+                     xtrace_riscv_reg(rs1));
+      break;
+    }
     case RISCV_SB:
     case RISCV_SH:
     case RISCV_SW:
     case RISCV_SD: {
       unsigned int rs2, rs1, immhi, immlo;
       riscv_sw_decode_fields((uint16_t *)pc, &rs2, &rs1, &immhi, &immlo);
-      int32_t offset = sign_extend32(12, (immhi << 5) | immlo);
+      int32_t offset = xtrace_riscv_store_offset(immhi, immlo);
       xtrace_appendf(buf, cap, pos, " %s, %" PRId32 "(%s)",
                      xtrace_riscv_reg(rs2), offset, xtrace_riscv_reg(rs1));
+      break;
+    }
+    case RISCV_FSW:
+    case RISCV_FSD: {
+      unsigned int rs2, rs1, immhi, immlo;
+      riscv_fsw_decode_fields((uint16_t *)pc, &rs2, &rs1, &immhi, &immlo);
+      int32_t offset = xtrace_riscv_store_offset(immhi, immlo);
+      xtrace_appendf(buf, cap, pos, " %s, %" PRId32 "(%s)",
+                     xtrace_riscv_freg(rs2), offset, xtrace_riscv_reg(rs1));
+      break;
+    }
+    case RISCV_FLH: {
+      unsigned int offset, rs1, rd;
+      riscv_flh_decode_fields((uint16_t *)pc, &offset, &rs1, &rd);
+      xtrace_appendf(buf, cap, pos, " %s, %" PRId32 "(%s)",
+                     xtrace_riscv_freg(rd), sign_extend32(12, offset),
+                     xtrace_riscv_reg(rs1));
+      break;
+    }
+    case RISCV_FSH: {
+      unsigned int immhi, rs2, rs1, immlo;
+      riscv_fsh_decode_fields((uint16_t *)pc, &immhi, &rs2, &rs1, &immlo);
+      int32_t offset = xtrace_riscv_store_offset(immhi, immlo);
+      xtrace_appendf(buf, cap, pos, " %s, %" PRId32 "(%s)",
+                     xtrace_riscv_freg(rs2), offset, xtrace_riscv_reg(rs1));
+      break;
+    }
+    case RISCV_ADDI:
+    case RISCV_SLTI:
+    case RISCV_SLTIU:
+    case RISCV_XORI:
+    case RISCV_ORI:
+    case RISCV_ANDI:
+    case RISCV_ADDIW: {
+      unsigned int rd, rs1, imm;
+      riscv_addi_decode_fields((uint16_t *)pc, &rd, &rs1, &imm);
+      xtrace_appendf(buf, cap, pos, " %s, %s, %" PRId32,
+                     xtrace_riscv_reg(rd), xtrace_riscv_reg(rs1),
+                     sign_extend32(12, imm));
+      break;
+    }
+    case RISCV_SLLI:
+    case RISCV_SRLI:
+    case RISCV_SRAI:
+    case RISCV_SLLIW:
+    case RISCV_SRLIW:
+    case RISCV_SRAIW: {
+      unsigned int rd, rs1, shamt;
+      riscv_slli_decode_fields((uint16_t *)pc, &rd, &rs1, &shamt);
+      xtrace_appendf(buf, cap, pos, " %s, %s, %u",
+                     xtrace_riscv_reg(rd), xtrace_riscv_reg(rs1), shamt);
+      break;
+    }
+    case RISCV_CSRRW:
+    case RISCV_CSRRS:
+    case RISCV_CSRRC: {
+      unsigned int rd, csr, rs1;
+      riscv_csrrw_decode_fields((uint16_t *)pc, &rd, &csr, &rs1);
+      xtrace_appendf(buf, cap, pos, " %s, 0x%x, %s",
+                     xtrace_riscv_reg(rd), csr, xtrace_riscv_reg(rs1));
+      break;
+    }
+    case RISCV_CSRRWI:
+    case RISCV_CSRRSI:
+    case RISCV_CSRRCI: {
+      unsigned int rd, csr, uimm;
+      riscv_csrrwi_decode_fields((uint16_t *)pc, &rd, &csr, &uimm);
+      xtrace_appendf(buf, cap, pos, " %s, 0x%x, %u",
+                     xtrace_riscv_reg(rd), csr, uimm);
+      break;
+    }
+    case RISCV_FENCE: {
+      unsigned int fm, pred, succ;
+      riscv_fence_decode_fields((uint16_t *)pc, &fm, &pred, &succ);
+      if (fm == 8 && pred == 3 && succ == 3) {
+        xtrace_appendf(buf, cap, pos, " tso");
+      } else {
+        xtrace_appendf(buf, cap, pos, " ");
+        xtrace_append_riscv_fence_set(buf, cap, pos, pred);
+        xtrace_appendf(buf, cap, pos, ", ");
+        xtrace_append_riscv_fence_set(buf, cap, pos, succ);
+        if (fm != 0) {
+          xtrace_appendf(buf, cap, pos, ", fm=0x%x", fm);
+        }
+      }
+      break;
+    }
+    case RISCV_ADD:
+    case RISCV_SUB:
+    case RISCV_SLL:
+    case RISCV_SLT:
+    case RISCV_SLTU:
+    case RISCV_XOR:
+    case RISCV_SRL:
+    case RISCV_SRA:
+    case RISCV_OR:
+    case RISCV_AND:
+    case RISCV_ADDW:
+    case RISCV_SUBW:
+    case RISCV_SLLW:
+    case RISCV_SRLW:
+    case RISCV_SRAW:
+    case RISCV_MUL:
+    case RISCV_MULH:
+    case RISCV_MULHSU:
+    case RISCV_MULHU:
+    case RISCV_DIV:
+    case RISCV_DIVU:
+    case RISCV_REM:
+    case RISCV_REMU:
+    case RISCV_MULW:
+    case RISCV_DIVW:
+    case RISCV_DIVUW:
+    case RISCV_REMW:
+    case RISCV_REMUW: {
+      unsigned int rd, rs1, rs2;
+      riscv_add_decode_fields((uint16_t *)pc, &rd, &rs1, &rs2);
+      xtrace_appendf(buf, cap, pos, " %s, %s, %s",
+                     xtrace_riscv_reg(rd), xtrace_riscv_reg(rs1),
+                     xtrace_riscv_reg(rs2));
+      break;
+    }
+    case RISCV_ADD_UW:
+    case RISCV_SH1ADD:
+    case RISCV_SH1ADD_UW:
+    case RISCV_SH2ADD:
+    case RISCV_SH2ADD_UW:
+    case RISCV_SH3ADD:
+    case RISCV_SH3ADD_UW:
+    case RISCV_ANDN:
+    case RISCV_ORN:
+    case RISCV_XNOR:
+    case RISCV_MAX:
+    case RISCV_MAXU:
+    case RISCV_MIN:
+    case RISCV_MINU:
+    case RISCV_ROL:
+    case RISCV_ROLW:
+    case RISCV_ROR:
+    case RISCV_RORW:
+    case RISCV_CLMUL:
+    case RISCV_CLMULH:
+    case RISCV_CLMULR:
+    case RISCV_BCLR:
+    case RISCV_BEXT:
+    case RISCV_BINV:
+    case RISCV_BSET:
+    case RISCV_CZERO_EQZ:
+    case RISCV_CZERO_NEZ: {
+      unsigned int rs2, rs1, rd;
+      riscv_add_uw_decode_fields((uint16_t *)pc, &rs2, &rs1, &rd);
+      xtrace_appendf(buf, cap, pos, " %s, %s, %s",
+                     xtrace_riscv_reg(rd), xtrace_riscv_reg(rs1),
+                     xtrace_riscv_reg(rs2));
+      break;
+    }
+    case RISCV_SLLI_UW:
+    case RISCV_RORI:
+    case RISCV_RORIW:
+    case RISCV_BCLRI:
+    case RISCV_BEXTI:
+    case RISCV_BINVI:
+    case RISCV_BSETI: {
+      unsigned int shamt, rs1, rd;
+      riscv_slli_uw_decode_fields((uint16_t *)pc, &shamt, &rs1, &rd);
+      xtrace_appendf(buf, cap, pos, " %s, %s, %u",
+                     xtrace_riscv_reg(rd), xtrace_riscv_reg(rs1), shamt);
+      break;
+    }
+    case RISCV_CLZ:
+    case RISCV_CLZW:
+    case RISCV_CTZ:
+    case RISCV_CTZW:
+    case RISCV_CPOP:
+    case RISCV_CPOPW:
+    case RISCV_SEXT_B:
+    case RISCV_SEXT_H:
+    case RISCV_ZEXT_H:
+    case RISCV_ORC_B:
+    case RISCV_REV8: {
+      unsigned int rs1, rd;
+      riscv_clz_decode_fields((uint16_t *)pc, &rs1, &rd);
+      xtrace_appendf(buf, cap, pos, " %s, %s",
+                     xtrace_riscv_reg(rd), xtrace_riscv_reg(rs1));
+      break;
+    }
+    case RISCV_LUI:
+    case RISCV_AUIPC: {
+      unsigned int rd, imm;
+      riscv_lui_decode_fields((uint16_t *)pc, &rd, &imm);
+      xtrace_appendf(buf, cap, pos, " %s, 0x%x",
+                     xtrace_riscv_reg(rd), imm);
+      break;
+    }
+    case RISCV_LR_W:
+    case RISCV_LR_D: {
+      unsigned int aq, rl, rd, rs1;
+      riscv_lr_w_decode_fields((uint16_t *)pc, &aq, &rl, &rd, &rs1);
+      xtrace_append_riscv_aqrl(buf, cap, pos, aq, rl);
+      xtrace_appendf(buf, cap, pos, " %s, (%s)",
+                     xtrace_riscv_reg(rd), xtrace_riscv_reg(rs1));
+      break;
+    }
+    case RISCV_SC_W:
+    case RISCV_SC_D:
+    case RISCV_AMOSWAP_W:
+    case RISCV_AMOADD_W:
+    case RISCV_AMOXOR_W:
+    case RISCV_AMOAND_W:
+    case RISCV_AMOOR_W:
+    case RISCV_AMOMIN_W:
+    case RISCV_AMOMAX_W:
+    case RISCV_AMOMINU_W:
+    case RISCV_AMOMAXU_W:
+    case RISCV_AMOSWAP_D:
+    case RISCV_AMOADD_D:
+    case RISCV_AMOXOR_D:
+    case RISCV_AMOAND_D:
+    case RISCV_AMOOR_D:
+    case RISCV_AMOMIN_D:
+    case RISCV_AMOMAX_D:
+    case RISCV_AMOMINU_D:
+    case RISCV_AMOMAXU_D: {
+      unsigned int aq, rl, rd, rs2, rs1;
+      riscv_sc_w_decode_fields((uint16_t *)pc, &aq, &rl, &rd, &rs2, &rs1);
+      xtrace_append_riscv_aqrl(buf, cap, pos, aq, rl);
+      xtrace_appendf(buf, cap, pos, " %s, %s, (%s)",
+                     xtrace_riscv_reg(rd), xtrace_riscv_reg(rs2),
+                     xtrace_riscv_reg(rs1));
+      break;
+    }
+    case RISCV_FMADD_S:
+    case RISCV_FMSUB_S:
+    case RISCV_FNMSUB_S:
+    case RISCV_FNMADD_S:
+    case RISCV_FMADD_D:
+    case RISCV_FMSUB_D:
+    case RISCV_FNMSUB_D:
+    case RISCV_FNMADD_D: {
+      unsigned int rd, rs1, rs2, rs3, rm;
+      riscv_fmadd_s_decode_fields((uint16_t *)pc, &rd, &rs1, &rs2, &rs3, &rm);
+      xtrace_appendf(buf, cap, pos, " %s, %s, %s, %s, %s",
+                     xtrace_riscv_freg(rd), xtrace_riscv_freg(rs1),
+                     xtrace_riscv_freg(rs2), xtrace_riscv_freg(rs3),
+                     xtrace_riscv_rm(rm));
+      break;
+    }
+    case RISCV_FMADD_H:
+    case RISCV_FMSUB_H:
+    case RISCV_FNMSUB_H:
+    case RISCV_FNMADD_H: {
+      unsigned int rs3, rs2, rs1, rm, rd;
+      riscv_fmadd_h_decode_fields((uint16_t *)pc, &rs3, &rs2, &rs1, &rm, &rd);
+      xtrace_appendf(buf, cap, pos, " %s, %s, %s, %s, %s",
+                     xtrace_riscv_freg(rd), xtrace_riscv_freg(rs1),
+                     xtrace_riscv_freg(rs2), xtrace_riscv_freg(rs3),
+                     xtrace_riscv_rm(rm));
+      break;
+    }
+    case RISCV_FADD_S:
+    case RISCV_FSUB_S:
+    case RISCV_FMUL_S:
+    case RISCV_FDIV_S:
+    case RISCV_FADD_D:
+    case RISCV_FSUB_D:
+    case RISCV_FMUL_D:
+    case RISCV_FDIV_D: {
+      unsigned int rd, rs1, rs2, rm;
+      riscv_fadd_s_decode_fields((uint16_t *)pc, &rd, &rs1, &rs2, &rm);
+      xtrace_appendf(buf, cap, pos, " %s, %s, %s, %s",
+                     xtrace_riscv_freg(rd), xtrace_riscv_freg(rs1),
+                     xtrace_riscv_freg(rs2), xtrace_riscv_rm(rm));
+      break;
+    }
+    case RISCV_FADD_H:
+    case RISCV_FSUB_H:
+    case RISCV_FMUL_H:
+    case RISCV_FDIV_H: {
+      unsigned int rs2, rs1, rm, rd;
+      riscv_fadd_h_decode_fields((uint16_t *)pc, &rs2, &rs1, &rm, &rd);
+      xtrace_appendf(buf, cap, pos, " %s, %s, %s, %s",
+                     xtrace_riscv_freg(rd), xtrace_riscv_freg(rs1),
+                     xtrace_riscv_freg(rs2), xtrace_riscv_rm(rm));
+      break;
+    }
+    case RISCV_FSQRT_S:
+    case RISCV_FSQRT_D: {
+      unsigned int rd, rs1, rm;
+      riscv_fsqrt_s_decode_fields((uint16_t *)pc, &rd, &rs1, &rm);
+      xtrace_appendf(buf, cap, pos, " %s, %s, %s",
+                     xtrace_riscv_freg(rd), xtrace_riscv_freg(rs1),
+                     xtrace_riscv_rm(rm));
+      break;
+    }
+    case RISCV_FSQRT_H: {
+      unsigned int rs1, rm, rd;
+      riscv_fsqrt_h_decode_fields((uint16_t *)pc, &rs1, &rm, &rd);
+      xtrace_appendf(buf, cap, pos, " %s, %s, %s",
+                     xtrace_riscv_freg(rd), xtrace_riscv_freg(rs1),
+                     xtrace_riscv_rm(rm));
+      break;
+    }
+    case RISCV_FSGNJ_S:
+    case RISCV_FSGNJN_S:
+    case RISCV_FSGNJX_S:
+    case RISCV_FMIN_S:
+    case RISCV_FMAX_S:
+    case RISCV_FSGNJ_D:
+    case RISCV_FSGNJN_D:
+    case RISCV_FSGNJX_D:
+    case RISCV_FMIN_D:
+    case RISCV_FMAX_D: {
+      unsigned int rd, rs1, rs2;
+      riscv_fsgnj_s_decode_fields((uint16_t *)pc, &rd, &rs1, &rs2);
+      xtrace_appendf(buf, cap, pos, " %s, %s, %s",
+                     xtrace_riscv_freg(rd), xtrace_riscv_freg(rs1),
+                     xtrace_riscv_freg(rs2));
+      break;
+    }
+    case RISCV_FSGNJ_H:
+    case RISCV_FSGNJN_H:
+    case RISCV_FSGNJX_H:
+    case RISCV_FMIN_H:
+    case RISCV_FMAX_H: {
+      unsigned int rs2, rs1, rd;
+      riscv_fsgnj_h_decode_fields((uint16_t *)pc, &rs2, &rs1, &rd);
+      xtrace_appendf(buf, cap, pos, " %s, %s, %s",
+                     xtrace_riscv_freg(rd), xtrace_riscv_freg(rs1),
+                     xtrace_riscv_freg(rs2));
+      break;
+    }
+    case RISCV_FEQ_S:
+    case RISCV_FLT_S:
+    case RISCV_FLE_S:
+    case RISCV_FEQ_D:
+    case RISCV_FLT_D:
+    case RISCV_FLE_D: {
+      unsigned int rd, rs1, rs2;
+      riscv_feq_s_decode_fields((uint16_t *)pc, &rd, &rs1, &rs2);
+      xtrace_appendf(buf, cap, pos, " %s, %s, %s",
+                     xtrace_riscv_reg(rd), xtrace_riscv_freg(rs1),
+                     xtrace_riscv_freg(rs2));
+      break;
+    }
+    case RISCV_FEQ_H:
+    case RISCV_FLT_H:
+    case RISCV_FLE_H: {
+      unsigned int rs2, rs1, rd;
+      riscv_feq_h_decode_fields((uint16_t *)pc, &rs2, &rs1, &rd);
+      xtrace_appendf(buf, cap, pos, " %s, %s, %s",
+                     xtrace_riscv_reg(rd), xtrace_riscv_freg(rs1),
+                     xtrace_riscv_freg(rs2));
+      break;
+    }
+    case RISCV_FCLASS_S:
+    case RISCV_FCLASS_D:
+    case RISCV_FMV_X_W:
+    case RISCV_FMV_X_D: {
+      unsigned int rd, rs1;
+      riscv_fmv_x_w_decode_fields((uint16_t *)pc, &rd, &rs1);
+      xtrace_appendf(buf, cap, pos, " %s, %s",
+                     xtrace_riscv_reg(rd), xtrace_riscv_freg(rs1));
+      break;
+    }
+    case RISCV_FCLASS_H:
+    case RISCV_FMV_X_H: {
+      unsigned int rs1, rd;
+      riscv_fmv_x_h_decode_fields((uint16_t *)pc, &rs1, &rd);
+      xtrace_appendf(buf, cap, pos, " %s, %s",
+                     xtrace_riscv_reg(rd), xtrace_riscv_freg(rs1));
+      break;
+    }
+    case RISCV_FMV_W_X:
+    case RISCV_FMV_D_X: {
+      unsigned int rd, rs1;
+      riscv_fmv_w_x_decode_fields((uint16_t *)pc, &rd, &rs1);
+      xtrace_appendf(buf, cap, pos, " %s, %s",
+                     xtrace_riscv_freg(rd), xtrace_riscv_reg(rs1));
+      break;
+    }
+    case RISCV_FMV_H_X: {
+      unsigned int rs1, rd;
+      riscv_fmv_h_x_decode_fields((uint16_t *)pc, &rs1, &rd);
+      xtrace_appendf(buf, cap, pos, " %s, %s",
+                     xtrace_riscv_freg(rd), xtrace_riscv_reg(rs1));
+      break;
+    }
+    case RISCV_FCVT_W_S:
+    case RISCV_FCVT_WU_S:
+    case RISCV_FCVT_L_S:
+    case RISCV_FCVT_LU_S:
+    case RISCV_FCVT_W_D:
+    case RISCV_FCVT_WU_D:
+    case RISCV_FCVT_L_D:
+    case RISCV_FCVT_LU_D: {
+      unsigned int rd, rs1, rm;
+      riscv_fcvt_w_s_decode_fields((uint16_t *)pc, &rd, &rs1, &rm);
+      xtrace_appendf(buf, cap, pos, " %s, %s, %s",
+                     xtrace_riscv_reg(rd), xtrace_riscv_freg(rs1),
+                     xtrace_riscv_rm(rm));
+      break;
+    }
+    case RISCV_FCVT_W_H:
+    case RISCV_FCVT_WU_H:
+    case RISCV_FCVT_L_H:
+    case RISCV_FCVT_LU_H: {
+      unsigned int rs1, rm, rd;
+      riscv_fcvt_w_h_decode_fields((uint16_t *)pc, &rs1, &rm, &rd);
+      xtrace_appendf(buf, cap, pos, " %s, %s, %s",
+                     xtrace_riscv_reg(rd), xtrace_riscv_freg(rs1),
+                     xtrace_riscv_rm(rm));
+      break;
+    }
+    case RISCV_FCVT_S_W:
+    case RISCV_FCVT_S_WU:
+    case RISCV_FCVT_S_L:
+    case RISCV_FCVT_S_LU:
+    case RISCV_FCVT_D_W:
+    case RISCV_FCVT_D_WU:
+    case RISCV_FCVT_D_L:
+    case RISCV_FCVT_D_LU: {
+      unsigned int rd, rs1, rm;
+      riscv_fcvt_s_w_decode_fields((uint16_t *)pc, &rd, &rs1, &rm);
+      xtrace_appendf(buf, cap, pos, " %s, %s, %s",
+                     xtrace_riscv_freg(rd), xtrace_riscv_reg(rs1),
+                     xtrace_riscv_rm(rm));
+      break;
+    }
+    case RISCV_FCVT_H_W:
+    case RISCV_FCVT_H_WU:
+    case RISCV_FCVT_H_L:
+    case RISCV_FCVT_H_LU: {
+      unsigned int rs1, rm, rd;
+      riscv_fcvt_h_w_decode_fields((uint16_t *)pc, &rs1, &rm, &rd);
+      xtrace_appendf(buf, cap, pos, " %s, %s, %s",
+                     xtrace_riscv_freg(rd), xtrace_riscv_reg(rs1),
+                     xtrace_riscv_rm(rm));
+      break;
+    }
+    case RISCV_FCVT_S_D:
+    case RISCV_FCVT_D_S: {
+      unsigned int rd, rs1, rm;
+      riscv_fcvt_s_d_decode_fields((uint16_t *)pc, &rd, &rs1, &rm);
+      xtrace_appendf(buf, cap, pos, " %s, %s, %s",
+                     xtrace_riscv_freg(rd), xtrace_riscv_freg(rs1),
+                     xtrace_riscv_rm(rm));
+      break;
+    }
+    case RISCV_FCVT_S_H:
+    case RISCV_FCVT_H_S:
+    case RISCV_FCVT_D_H:
+    case RISCV_FCVT_H_D: {
+      unsigned int rs1, rm, rd;
+      riscv_fcvt_s_h_decode_fields((uint16_t *)pc, &rs1, &rm, &rd);
+      xtrace_appendf(buf, cap, pos, " %s, %s, %s",
+                     xtrace_riscv_freg(rd), xtrace_riscv_freg(rs1),
+                     xtrace_riscv_rm(rm));
+      break;
+    }
+    case RISCV_CBO_CLEAN:
+    case RISCV_CBO_FLUSH:
+    case RISCV_CBO_INVAL:
+    case RISCV_CBO_ZERO: {
+      unsigned int rs1;
+      riscv_cbo_clean_decode_fields((uint16_t *)pc, &rs1);
+      xtrace_appendf(buf, cap, pos, " (%s)", xtrace_riscv_reg(rs1));
+      break;
+    }
+    case RISCV_PREFETCH_I:
+    case RISCV_PREFETCH_R:
+    case RISCV_PREFETCH_W: {
+      unsigned int offset, rs1;
+      riscv_prefetch_i_decode_fields((uint16_t *)pc, &offset, &rs1);
+      xtrace_appendf(buf, cap, pos, " %u(%s)",
+                     offset, xtrace_riscv_reg(rs1));
+      break;
+    }
+    case RISCV_V_OP: {
+      unsigned int funct, rs1_vs1, funct3, rd_vd;
+      riscv_v_op_decode_fields((uint16_t *)pc, &funct, &rs1_vs1, &funct3, &rd_vd);
+      xtrace_appendf(buf, cap, pos, " v%u, rs1/vs1=%u, funct=0x%x, funct3=0x%x",
+                     rd_vd, rs1_vs1, funct, funct3);
+      break;
+    }
+    case RISCV_V_LOAD_B:
+    case RISCV_V_LOAD_H:
+    case RISCV_V_LOAD_W:
+    case RISCV_V_LOAD_D: {
+      unsigned int lumop, rs1, vd;
+      riscv_v_load_b_decode_fields((uint16_t *)pc, &lumop, &rs1, &vd);
+      xtrace_appendf(buf, cap, pos, " v%u, (%s), lumop=0x%x",
+                     vd, xtrace_riscv_reg(rs1), lumop);
+      break;
+    }
+    case RISCV_V_STORE_B:
+    case RISCV_V_STORE_H:
+    case RISCV_V_STORE_W:
+    case RISCV_V_STORE_D: {
+      unsigned int sumop, rs1, vs3;
+      riscv_v_store_b_decode_fields((uint16_t *)pc, &sumop, &rs1, &vs3);
+      xtrace_appendf(buf, cap, pos, " v%u, (%s), sumop=0x%x",
+                     vs3, xtrace_riscv_reg(rs1), sumop);
+      break;
+    }
+    case RISCV_V_AMO_B:
+    case RISCV_V_AMO_H:
+    case RISCV_V_AMO_W:
+    case RISCV_V_AMO_D: {
+      unsigned int amoop, rs1, vd;
+      riscv_v_amo_b_decode_fields((uint16_t *)pc, &amoop, &rs1, &vd);
+      xtrace_appendf(buf, cap, pos, " v%u, (%s), amoop=0x%x",
+                     vd, xtrace_riscv_reg(rs1), amoop);
+      break;
+    }
+    case RISCV_JAL: {
+      unsigned int rd, imm;
+      riscv_jal_decode_fields((uint16_t *)pc, &rd, &imm);
+      int32_t offset = xtrace_riscv_jal_offset(imm);
+      xtrace_appendf(buf, cap, pos, " %s, 0x%" PRIxPTR,
+                     xtrace_riscv_reg(rd),
+                     (uintptr_t)((intptr_t)pc + offset));
+      break;
+    }
+    case RISCV_JALR: {
+      unsigned int rd, rs1, imm;
+      riscv_jalr_decode_fields((uint16_t *)pc, &rd, &rs1, &imm);
+      xtrace_appendf(buf, cap, pos, " %s, %" PRId32 "(%s)",
+                     xtrace_riscv_reg(rd), sign_extend32(12, imm),
+                     xtrace_riscv_reg(rs1));
+      break;
+    }
+    case RISCV_BEQ:
+    case RISCV_BNE:
+    case RISCV_BLT:
+    case RISCV_BGE:
+    case RISCV_BLTU:
+    case RISCV_BGEU: {
+      unsigned int rs1, rs2, immhi, immlo;
+      riscv_blt_decode_fields((uint16_t *)pc, &rs1, &rs2, &immhi, &immlo);
+      int32_t offset = xtrace_riscv_branch_offset(immhi, immlo);
+      xtrace_appendf(buf, cap, pos, " %s, %s, 0x%" PRIxPTR,
+                     xtrace_riscv_reg(rs1), xtrace_riscv_reg(rs2),
+                     (uintptr_t)((intptr_t)pc + offset));
+      break;
+    }
+    case RISCV_BRANCH: {
+      unsigned int funct3, rs1, rs2, immhi, immlo;
+      riscv_branch_decode_fields((uint16_t *)pc, &funct3, &rs1, &rs2,
+                                 &immhi, &immlo);
+      int32_t offset = xtrace_riscv_branch_offset(immhi, immlo);
+      xtrace_appendf(buf, cap, pos, " cond=%u, %s, %s, 0x%" PRIxPTR,
+                     funct3, xtrace_riscv_reg(rs1), xtrace_riscv_reg(rs2),
+                     (uintptr_t)((intptr_t)pc + offset));
       break;
     }
     default:
