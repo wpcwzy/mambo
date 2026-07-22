@@ -18,6 +18,7 @@
 #if defined(PLUGINS_NEW) || defined(XTRACE_DECODER)
 
 #include <assert.h>
+#include <ctype.h>
 #include <errno.h>
 #include <inttypes.h>
 #include <pthread.h>
@@ -54,10 +55,16 @@ struct xtrace_thread {
   uint64_t instruction_count;
   uintptr_t next_pc;
   bool has_next_pc;
+  bool instrument_block;
   struct xtrace_event *events;
   void *compressed;
   size_t compressed_capacity;
   ZSTD_CCtx *compression_ctx;
+};
+
+struct xtrace_function_filter {
+  char *name;
+  bool matched;
 };
 
 static FILE *xtrace_file;
@@ -74,6 +81,10 @@ static uint32_t xtrace_next_thread_id;
 static uint64_t xtrace_total_events;
 static uint64_t xtrace_total_raw_bytes;
 static uint64_t xtrace_total_stored_bytes;
+static struct xtrace_function_filter *xtrace_function_filters;
+static size_t xtrace_function_filter_count;
+static size_t xtrace_function_filter_capacity;
+static bool xtrace_selective_capture;
 static pthread_mutex_t xtrace_output_lock = PTHREAD_MUTEX_INITIALIZER;
 
 enum xtrace_timestamp_mode {
@@ -170,7 +181,106 @@ static int xtrace_meta_inst(uintptr_t meta) {
 }
 
 #ifndef XTRACE_DECODER
+static void xtrace_add_function_filter(const char *value, size_t length) {
+  while (length != 0 && isspace((unsigned char)*value)) {
+    value++;
+    length--;
+  }
+  while (length != 0 && isspace((unsigned char)value[length - 1])) {
+    length--;
+  }
+  if (length == 0) {
+    return;
+  }
+
+  for (size_t i = 0; i < xtrace_function_filter_count; i++) {
+    if (strlen(xtrace_function_filters[i].name) == length &&
+        strncmp(xtrace_function_filters[i].name, value, length) == 0) {
+      return;
+    }
+  }
+
+  if (xtrace_function_filter_count == xtrace_function_filter_capacity) {
+    size_t capacity = xtrace_function_filter_capacity == 0
+                          ? 8
+                          : xtrace_function_filter_capacity * 2;
+    void *filters = realloc(xtrace_function_filters,
+                            capacity * sizeof(*xtrace_function_filters));
+    if (filters == NULL) {
+      fprintf(stderr, "xtrace: failed to allocate function filters\n");
+      abort();
+    }
+    xtrace_function_filters = filters;
+    xtrace_function_filter_capacity = capacity;
+  }
+
+  char *name = strndup(value, length);
+  if (name == NULL) {
+    fprintf(stderr, "xtrace: failed to allocate a function filter\n");
+    abort();
+  }
+  xtrace_function_filters[xtrace_function_filter_count++] =
+      (struct xtrace_function_filter){.name = name};
+}
+
+static void xtrace_parse_function_list(const char *list) {
+  const char *start = list;
+  for (const char *cursor = list;; cursor++) {
+    if (*cursor == ',' || *cursor == '\0') {
+      xtrace_add_function_filter(start, (size_t)(cursor - start));
+      if (*cursor == '\0') {
+        break;
+      }
+      start = cursor + 1;
+    }
+  }
+}
+
+static void xtrace_parse_function_file(const char *path) {
+  FILE *file = fopen(path, "r");
+  if (file == NULL) {
+    fprintf(stderr, "xtrace: failed to open function file %s: %s\n", path,
+            strerror(errno));
+    abort();
+  }
+
+  char *line = NULL;
+  size_t capacity = 0;
+  while (getline(&line, &capacity, file) >= 0) {
+    char *content = line;
+    while (isspace((unsigned char)*content)) {
+      content++;
+    }
+    if (*content != '\0' && *content != '#') {
+      xtrace_parse_function_list(content);
+    }
+  }
+  if (ferror(file)) {
+    fprintf(stderr, "xtrace: failed to read function file %s: %s\n", path,
+            strerror(errno));
+    free(line);
+    fclose(file);
+    abort();
+  }
+  free(line);
+  fclose(file);
+}
+
 static void xtrace_parse_config(void) {
+  const char *functions = getenv("MAMBO_XTRACE_FUNCTIONS");
+  const char *function_file = getenv("MAMBO_XTRACE_FUNCTION_FILE");
+  xtrace_selective_capture = functions != NULL || function_file != NULL;
+  if (functions != NULL && functions[0] != '\0') {
+    xtrace_parse_function_list(functions);
+  }
+  if (function_file != NULL && function_file[0] != '\0') {
+    xtrace_parse_function_file(function_file);
+  }
+  if (xtrace_selective_capture && xtrace_function_filter_count == 0) {
+    fprintf(stderr, "xtrace: selective capture has no function names\n");
+    abort();
+  }
+
   const char *ring = getenv("MAMBO_XTRACE_RING");
   if (ring != NULL && ring[0] != '\0') {
     xtrace_ring_level = atoi(ring);
@@ -227,6 +337,31 @@ static void xtrace_parse_config(void) {
   if (level != NULL && level[0] != '\0') {
     xtrace_compression_level = atoi(level);
   }
+}
+
+static bool xtrace_should_instrument(uintptr_t pc) {
+  if (!xtrace_selective_capture) {
+    return true;
+  }
+
+  char *symbol = NULL;
+  if (get_symbol_info_by_addr(pc, &symbol, NULL, NULL) != 0 ||
+      symbol == NULL) {
+    free(symbol);
+    return false;
+  }
+
+  bool selected = false;
+  for (size_t i = 0; i < xtrace_function_filter_count; i++) {
+    if (strcmp(symbol, xtrace_function_filters[i].name) == 0) {
+      __atomic_store_n(&xtrace_function_filters[i].matched, true,
+                       __ATOMIC_RELAXED);
+      selected = true;
+      break;
+    }
+  }
+  free(symbol);
+  return selected;
 }
 
 static void xtrace_open_file(void) {
@@ -1666,6 +1801,11 @@ void xtrace_record_store_post(struct xtrace_thread *thread) {
 }
 
 int xtrace_pre_inst_handler(mambo_context *ctx) {
+  struct xtrace_thread *thread = mambo_get_thread_plugin_data(ctx);
+  if (!thread->instrument_block) {
+    return 0;
+  }
+
   bool is_load = mambo_is_load(ctx);
   bool is_store = mambo_is_store(ctx);
   bool is_mem = is_load || is_store;
@@ -1766,6 +1906,11 @@ int xtrace_pre_inst_handler(mambo_context *ctx) {
 }
 
 int xtrace_post_inst_handler(mambo_context *ctx) {
+  struct xtrace_thread *thread = mambo_get_thread_plugin_data(ctx);
+  if (!thread->instrument_block) {
+    return 0;
+  }
+
   if (!mambo_is_store(ctx)) {
     return 0;
   }
@@ -1800,6 +1945,14 @@ int xtrace_post_inst_handler(mambo_context *ctx) {
     assert(ret == 0);
   }
 
+  return 0;
+}
+
+int xtrace_pre_basic_block_handler(mambo_context *ctx) {
+  struct xtrace_thread *thread = mambo_get_thread_plugin_data(ctx);
+  assert(thread != NULL);
+  thread->instrument_block =
+      xtrace_should_instrument(xtrace_source_addr(ctx));
   return 0;
 }
 
@@ -1878,6 +2031,19 @@ int xtrace_exit_handler(mambo_context *ctx) {
             xtrace_output_failed ? ", output incomplete" : "");
   }
 
+  if (xtrace_selective_capture) {
+    for (size_t i = 0; i < xtrace_function_filter_count; i++) {
+      if (!__atomic_load_n(&xtrace_function_filters[i].matched,
+                           __ATOMIC_RELAXED)) {
+        fprintf(stderr, "xtrace: function '%s' was not matched in translated "
+                        "executable code (missing symbol or not executed)\n",
+                xtrace_function_filters[i].name);
+      }
+      free(xtrace_function_filters[i].name);
+    }
+    free(xtrace_function_filters);
+  }
+
   if (xtrace_close_file) {
     fclose(xtrace_file);
   }
@@ -1897,6 +2063,7 @@ __attribute__((constructor)) void xtrace_init_plugin(void) {
 
   mambo_register_pre_thread_cb(ctx, &xtrace_pre_thread_handler);
   mambo_register_post_thread_cb(ctx, &xtrace_post_thread_handler);
+  mambo_register_pre_basic_block_cb(ctx, &xtrace_pre_basic_block_handler);
   mambo_register_pre_inst_cb(ctx, &xtrace_pre_inst_handler);
   mambo_register_post_inst_cb(ctx, &xtrace_post_inst_handler);
   mambo_register_exit_cb(ctx, &xtrace_exit_handler);

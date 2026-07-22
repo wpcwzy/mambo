@@ -57,6 +57,39 @@ the final compression summary are written to stderr.
 | `MAMBO_XTRACE_CPU_HZ` | `1600000000` | CPU frequency used to convert sampled nanoseconds to cycles |
 | `MAMBO_XTRACE_RING` | `3` | Ring value emitted by the text decoder |
 | `MAMBO_XTRACE_BASE` | first PC | Override the PC printed by the ring header |
+| `MAMBO_XTRACE_FUNCTIONS` | unset | Comma-separated ELF function names to capture |
+| `MAMBO_XTRACE_FUNCTION_FILE` | unset | File containing function names, one per line |
+
+## Selective function capture
+
+To avoid the runtime cost and output volume of a whole-program trace, xtrace
+can instrument only the functions identified as hot by perf:
+
+```sh
+MAMBO_XTRACE_FUNCTIONS=hot_function,other_hot_function \
+  MAMBO_XTRACE_FILE=hot.xtr ./mambo_xtrace ./workload
+```
+
+For a generated list, put one ELF symbol name on each line. Blank lines and
+lines starting with `#` are ignored; comma-separated names are also accepted
+on a line:
+
+```sh
+MAMBO_XTRACE_FUNCTION_FILE=perf-hot-functions.txt \
+  MAMBO_XTRACE_FILE=hot.xtr ./mambo_xtrace ./workload
+```
+
+The filter is applied while MAMBO translates each basic block. Blocks outside
+the selected function bodies receive no xtrace instrumentation, rather than a
+runtime check, so their execution does not pay the per-instruction tracing
+cost. Calls made by a selected function are not traced unless the callee is
+also selected. Function names must match the ELF symbol table exactly; use
+mangled names for C++, and retain symbols in the binaries being measured.
+Xtrace reports every configured name that did not match translated executable
+code, either because its symbol was unavailable or the function was not run.
+
+If both filter variables are set their names are combined. If neither is set,
+xtrace retains whole-program capture behavior.
 
 Direct `rdcycle` access is not used because Debian may disable the userspace
 counter and raise `SIGILL`. The default `clock` mode samples
