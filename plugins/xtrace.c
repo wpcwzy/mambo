@@ -74,15 +74,6 @@ static void xtrace_appendf(char *buf, size_t cap, size_t *pos,
 }
 
 static uint64_t xtrace_read_stamp(void) {
-#if defined(__aarch64__)
-  uint64_t stamp;
-  asm volatile("mrs %0, cntvct_el0" : "=r"(stamp));
-  return stamp;
-#elif defined(__riscv)
-  uint64_t stamp;
-  asm volatile("rdcycle %0" : "=r"(stamp));
-  return stamp;
-#else
   struct timespec ts;
 #ifdef CLOCK_MONOTONIC_RAW
   clock_gettime(CLOCK_MONOTONIC_RAW, &ts);
@@ -90,7 +81,6 @@ static uint64_t xtrace_read_stamp(void) {
   clock_gettime(CLOCK_MONOTONIC, &ts);
 #endif
   return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
-#endif
 }
 
 static uint64_t xtrace_timestamp(void) {
