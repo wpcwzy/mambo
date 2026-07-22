@@ -1,6 +1,7 @@
 dbm
 api/emit_*.c
 api/emit_*.h
+plugins/xtrace_disasm.h
 elf/elf_loader.o
 elf/symbol_parser.o
 .vscode/

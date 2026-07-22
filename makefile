@@ -6,6 +6,7 @@
 #PLUGINS+=plugins/poc_log_returns.c
 #PLUGINS+=plugins/instruction_mix.c
 #PLUGINS+=plugins/strace.c
+#PLUGINS+=plugins/xtrace.c
 #PLUGINS+=plugins/symbol_example.c
 #PLUGINS+=plugins/memcheck/memcheck.S plugins/memcheck/memcheck.c plugins/memcheck/naive_stdlib.c
 #PLUGINS+=plugins/follow_exec.c
@@ -31,7 +32,7 @@ CFLAGS+=-DVERSION=\"$(VERSION)\"
 
 LDFLAGS+=-static -ldl
 LIBS=-lelf -lzstd -lpthread -lz
-HEADERS=*.h makefile
+HEADERS=*.h makefile plugins/xtrace_disasm.h
 INCLUDES=-I/usr/include/libelf -I.
 SOURCES= common.c dbm.c traces.c syscalls.c dispatcher.c util.S traces_common.c
 SOURCES+=api/helpers.c api/plugin_support.c api/branch_decoder_support.c api/load_store.c api/internal.c api/hash_table.c
@@ -80,7 +81,7 @@ ifdef PLUGINS
 	CFLAGS += -DPLUGINS_NEW
 endif
 
-.PHONY: pie clean cleanall
+.PHONY: pie clean cleanall xtrace
 
 all:
 	$(info MAMBO: detected architecture "$(ARCH)")
@@ -107,8 +108,14 @@ cachesim:
 memcheck:
 	PLUGINS="plugins/memcheck/memcheck.S plugins/memcheck/memcheck.c plugins/memcheck/naive_stdlib.c" OUTPUT_FILE=mambo_memcheck make
 
+xtrace:
+	$(MAKE) PLUGINS="plugins/xtrace.c" OUTPUT_FILE=mambo_xtrace
+
+plugins/xtrace_disasm.h: plugins/generate_xtrace_disasm.rb pie/riscv.txt pie/a64.txt pie/arm.txt pie/thumb.txt
+	ruby plugins/generate_xtrace_disasm.rb > $@
+
 clean:
-	rm -f dbm elf/elf_loader.o elf/symbol_parser.o
+	rm -f dbm elf/elf_loader.o elf/symbol_parser.o plugins/xtrace_disasm.h
 
 cleanall: clean
 	$(MAKE) -C pie/ clean
