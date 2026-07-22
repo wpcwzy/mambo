@@ -36,7 +36,6 @@
 #define XTRACE_INST_META_INST_BITS 24
 #define XTRACE_INST_META_INST_MASK ((uintptr_t)((1u << XTRACE_INST_META_INST_BITS) - 1))
 #define XTRACE_MAX_BYTE_VALUE 16
-#define XTRACE_PAGE_SIZE 4096
 
 struct xtrace_thread {
   uintptr_t store_addr;
@@ -159,10 +158,9 @@ static void xtrace_print_ring_line(uintptr_t pc) {
     return;
   }
 
-  uintptr_t base = xtrace_has_base_override
-                     ? xtrace_base_override
-                     : pc & ~((uintptr_t)XTRACE_PAGE_SIZE - 1);
-  fprintf(xtrace_file, "ring %d %" PRIxPTR "\n", xtrace_ring_level, base);
+  uintptr_t target = xtrace_has_base_override ? xtrace_base_override : pc;
+  fprintf(xtrace_file, "ring %d, pc -> %" PRIxPTR "\n",
+          xtrace_ring_level, target);
   xtrace_ring_written = true;
 }
 
@@ -174,9 +172,6 @@ static void xtrace_format_bytes(char *buf, size_t cap, size_t *pos,
   }
 
   for (uintptr_t i = 0; i < inst_len; i++) {
-    if (i != 0) {
-      xtrace_appendf(buf, cap, pos, " ");
-    }
     xtrace_appendf(buf, cap, pos, "%02" PRIxPTR,
                    (encoding >> (i * 8)) & 0xff);
   }
@@ -188,7 +183,7 @@ static void xtrace_print_mem_value(uintptr_t addr, uintptr_t size) {
   } else if (size <= sizeof(uint64_t)) {
     uint64_t value = 0;
     memcpy(&value, (void *)addr, size);
-    fprintf(xtrace_file, "0x%" PRIx64, value);
+    fprintf(xtrace_file, "%" PRIx64, value);
   } else {
     unsigned char bytes[XTRACE_MAX_BYTE_VALUE];
     uintptr_t bytes_to_print = size;
@@ -197,7 +192,6 @@ static void xtrace_print_mem_value(uintptr_t addr, uintptr_t size) {
     }
 
     memcpy(bytes, (void *)addr, bytes_to_print);
-    fprintf(xtrace_file, "0x");
     for (uintptr_t i = 0; i < bytes_to_print; i++) {
       fprintf(xtrace_file, "%02x", bytes[i]);
     }
@@ -611,7 +605,14 @@ static void xtrace_append_riscv_operands(char *buf, size_t cap, size_t *pos,
       break;
     }
     case RISCV_C_ADDI:
-    case RISCV_C_ADDIW:
+    case RISCV_C_ADDIW: {
+      unsigned int rd, immhi, immlo;
+      riscv_c_addi_decode_fields((uint16_t *)pc, &rd, &immhi, &immlo);
+      xtrace_appendf(buf, cap, pos, " %s, %s, %" PRId32,
+                     xtrace_riscv_reg(rd), xtrace_riscv_reg(rd),
+                     xtrace_riscv_c_imm(immhi, immlo));
+      break;
+    }
     case RISCV_C_LI: {
       unsigned int rd, immhi, immlo;
       riscv_c_addi_decode_fields((uint16_t *)pc, &rd, &immhi, &immlo);
@@ -623,7 +624,7 @@ static void xtrace_append_riscv_operands(char *buf, size_t cap, size_t *pos,
     case RISCV_C_ADDI16SP: {
       unsigned int immhi, immlo;
       riscv_c_addi16sp_decode_fields((uint16_t *)pc, &immhi, &immlo);
-      xtrace_appendf(buf, cap, pos, " sp, %" PRId32,
+      xtrace_appendf(buf, cap, pos, " sp, sp, %" PRId32,
                      xtrace_riscv_c_addi16sp_imm(immhi, immlo));
       break;
     }
@@ -638,8 +639,8 @@ static void xtrace_append_riscv_operands(char *buf, size_t cap, size_t *pos,
     case RISCV_C_SLLI: {
       unsigned int rs1_rd, shhi, shlo;
       riscv_c_slli_decode_fields((uint16_t *)pc, &rs1_rd, &shhi, &shlo);
-      xtrace_appendf(buf, cap, pos, " %s, %u",
-                     xtrace_riscv_reg(rs1_rd),
+      xtrace_appendf(buf, cap, pos, " %s, %s, %u",
+                     xtrace_riscv_reg(rs1_rd), xtrace_riscv_reg(rs1_rd),
                      (shhi << 5) | shlo);
       break;
     }
@@ -647,7 +648,8 @@ static void xtrace_append_riscv_operands(char *buf, size_t cap, size_t *pos,
     case RISCV_C_SRAI: {
       unsigned int rs1_rd, shhi, shlo;
       riscv_c_slli_decode_fields((uint16_t *)pc, &rs1_rd, &shhi, &shlo);
-      xtrace_appendf(buf, cap, pos, " %s, %u",
+      xtrace_appendf(buf, cap, pos, " %s, %s, %u",
+                     xtrace_riscv_reg(rs1_rd + s0),
                      xtrace_riscv_reg(rs1_rd + s0),
                      (shhi << 5) | shlo);
       break;
@@ -655,7 +657,8 @@ static void xtrace_append_riscv_operands(char *buf, size_t cap, size_t *pos,
     case RISCV_C_ANDI: {
       unsigned int rs1_rd, immhi, immlo;
       riscv_c_andi_decode_fields((uint16_t *)pc, &rs1_rd, &immhi, &immlo);
-      xtrace_appendf(buf, cap, pos, " %s, %" PRId32,
+      xtrace_appendf(buf, cap, pos, " %s, %s, %" PRId32,
+                     xtrace_riscv_reg(rs1_rd + s0),
                      xtrace_riscv_reg(rs1_rd + s0),
                      xtrace_riscv_c_imm(immhi, immlo));
       break;
@@ -668,13 +671,21 @@ static void xtrace_append_riscv_operands(char *buf, size_t cap, size_t *pos,
     case RISCV_C_ADDW: {
       unsigned int rs1_rd, rs2;
       riscv_c_sub_decode_fields((uint16_t *)pc, &rs1_rd, &rs2);
-      xtrace_appendf(buf, cap, pos, " %s, %s",
+      xtrace_appendf(buf, cap, pos, " %s, %s, %s",
+                     xtrace_riscv_reg(rs1_rd + s0),
                      xtrace_riscv_reg(rs1_rd + s0),
                      xtrace_riscv_reg(rs2 + s0));
       break;
     }
-    case RISCV_C_MV:
     case RISCV_C_ADD: {
+      unsigned int rd, rs2;
+      riscv_c_add_decode_fields((uint16_t *)pc, &rd, &rs2);
+      xtrace_appendf(buf, cap, pos, " %s, %s, %s",
+                     xtrace_riscv_reg(rd),
+                     xtrace_riscv_reg(rd), xtrace_riscv_reg(rs2));
+      break;
+    }
+    case RISCV_C_MV: {
       unsigned int rd, rs2;
       riscv_c_add_decode_fields((uint16_t *)pc, &rd, &rs2);
       xtrace_appendf(buf, cap, pos, " %s, %s",
@@ -1349,7 +1360,7 @@ void xtrace_record_access_pre(struct xtrace_thread *thread, uintptr_t pc,
   uintptr_t size = info >> XTRACE_INFO_SIZE_SHIFT;
 
   if (info & XTRACE_INFO_LOAD) {
-    fprintf(xtrace_file, " - LD %" PRIuPTR " M[0x%" PRIxPTR "] -> ",
+    fprintf(xtrace_file, " - LD %" PRIuPTR " M[%" PRIxPTR "] -> ",
             size * 8, addr);
     xtrace_print_mem_value(addr, size);
     fprintf(xtrace_file, "\n");
@@ -1368,7 +1379,7 @@ void xtrace_record_store_post(struct xtrace_thread *thread) {
   }
 
   uintptr_t size = thread->store_info >> XTRACE_INFO_SIZE_SHIFT;
-  fprintf(xtrace_file, " - ST %" PRIuPTR " M[0x%" PRIxPTR "] <- ",
+  fprintf(xtrace_file, " - ST %" PRIuPTR " M[%" PRIxPTR "] <- ",
           size * 8, thread->store_addr);
   xtrace_print_mem_value(thread->store_addr, size);
   fprintf(xtrace_file, "\n");

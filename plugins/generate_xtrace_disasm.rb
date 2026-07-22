@@ -32,8 +32,25 @@ def emit_table(fn_name, type_name, insts)
 end
 
 riscv = parse_inst_file(File.expand_path("../pie/riscv.txt", __dir__), "RISCV_")
+# RVC encoding names such as c_sdsp are not assembly mnemonics. Emit the
+# equivalent base instruction name so trace consumers see one RV64 vocabulary.
+riscv_base_names = {
+  "c_addi4spn" => "addi",
+  "c_fldsp" => "fld",
+  "c_lwsp" => "lw",
+  "c_flwsp" => "flw",
+  "c_ldsp" => "ld",
+  "c_fsdsp" => "fsd",
+  "c_swsp" => "sw",
+  "c_sdsp" => "sd",
+  "c_addi16sp" => "addi"
+}
 riscv.each do |inst|
-  inst[1] = inst[1].delete_prefix("c_")
+  token = inst[1]
+  token = riscv_base_names.fetch(token, token.delete_prefix("c_"))
+  token = "fence.i" if token == "fencei"
+  token = token.tr("_", ".") unless token.start_with?("v_")
+  inst[1] = token
 end
 a64 = parse_inst_file(File.expand_path("../pie/a64.txt", __dir__), "A64_")
 arm = parse_inst_file(File.expand_path("../pie/arm.txt", __dir__), "ARM_")
