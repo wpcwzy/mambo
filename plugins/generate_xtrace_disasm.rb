@@ -32,6 +32,9 @@ def emit_table(fn_name, type_name, insts)
 end
 
 riscv = parse_inst_file(File.expand_path("../pie/riscv.txt", __dir__), "RISCV_")
+riscv.each do |inst|
+  inst[1] = inst[1].delete_prefix("c_")
+end
 a64 = parse_inst_file(File.expand_path("../pie/a64.txt", __dir__), "A64_")
 arm = parse_inst_file(File.expand_path("../pie/arm.txt", __dir__), "ARM_")
 thumb = parse_inst_file(File.expand_path("../pie/thumb.txt", __dir__), "THUMB_")
