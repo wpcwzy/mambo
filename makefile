@@ -39,6 +39,28 @@ SOURCES+=api/helpers.c api/plugin_support.c api/branch_decoder_support.c api/loa
 SOURCES+=elf/elf_loader.o elf/symbol_parser.o
 
 ARCH=$(shell $(CC) -dumpmachine | awk -F '-' '{print $$1}')
+XTRACE_ARCH?=$(ARCH)
+
+ifneq ($(filter riscv riscv64,$(XTRACE_ARCH)),)
+	XTRACE_PIE_ARCH=riscv
+	XTRACE_DECODER_CFLAGS=-D__riscv=1 -D__riscv_xlen=64
+	XTRACE_DECODER_PIE=pie/pie-riscv-decoder.o pie/pie-riscv-field-decoder.o
+	XTRACE_DECODER_HEADERS=api/emit_riscv.h
+endif
+ifneq ($(filter a64 aarch64,$(XTRACE_ARCH)),)
+	XTRACE_PIE_ARCH=a64
+	XTRACE_DECODER_CFLAGS=-D__aarch64__=1
+	XTRACE_DECODER_PIE=pie/pie-a64-decoder.o pie/pie-a64-field-decoder.o
+	XTRACE_DECODER_HEADERS=api/emit_a64.h
+endif
+ifneq ($(filter arm arm32,$(XTRACE_ARCH)),)
+	XTRACE_PIE_ARCH=arm
+	XTRACE_DECODER_CFLAGS=-D__arm__=1
+	XTRACE_DECODER_PIE=pie/pie-arm-decoder.o pie/pie-arm-field-decoder.o
+	XTRACE_DECODER_PIE+=pie/pie-thumb-decoder.o pie/pie-thumb-field-decoder.o
+	XTRACE_DECODER_HEADERS=api/emit_arm.h api/emit_thumb.h
+endif
+
 ifeq ($(findstring arm, $(ARCH)), arm)
 	CFLAGS += -march=armv7-a -mfpu=neon
 	LDFLAGS += -Wl,-Ttext-segment=$(or $(TEXT_SEGMENT),0xa8000000)
@@ -81,7 +103,7 @@ ifdef PLUGINS
 	CFLAGS += -DPLUGINS_NEW
 endif
 
-.PHONY: pie clean cleanall xtrace xtrace-decode
+.PHONY: pie clean cleanall xtrace xtrace-decode xtrace-decode-pie xtrace-decode-headers
 
 all:
 	$(info MAMBO: detected architecture "$(ARCH)")
@@ -112,8 +134,18 @@ xtrace:
 	$(MAKE) PLUGINS="plugins/xtrace.c" OUTPUT_FILE=mambo_xtrace
 	$(MAKE) xtrace-decode
 
-xtrace-decode: pie plugins/xtrace_disasm.h plugins/xtrace_format.h plugins/xtrace_zstd.h plugins/xtrace.c
-	$(CC) $(CFLAGS) $(INCLUDES) -DXTRACE_DECODER -o xtrace_decode plugins/xtrace.c $(PIE) $(or $(ZSTD_LIB),-lzstd)
+xtrace-decode-pie:
+	@test -n "$(XTRACE_PIE_ARCH)" || { \
+		echo "Unsupported XTRACE_ARCH '$(XTRACE_ARCH)' (use riscv64, aarch64, or arm32)" >&2; \
+		exit 2; \
+	}
+	$(MAKE) --no-print-directory -C pie/ ARCH=$(XTRACE_PIE_ARCH) CC="$(CC)" pie
+
+xtrace-decode-headers: xtrace-decode-pie
+	$(MAKE) --no-print-directory $(XTRACE_DECODER_HEADERS)
+
+xtrace-decode: xtrace-decode-headers plugins/xtrace_disasm.h plugins/xtrace_format.h plugins/xtrace_zstd.h plugins/xtrace.c
+	$(CC) $(CFLAGS) $(INCLUDES) $(XTRACE_DECODER_CFLAGS) -DXTRACE_DECODER -o xtrace_decode plugins/xtrace.c $(XTRACE_DECODER_PIE) $(or $(ZSTD_LIB),-lzstd)
 
 plugins/xtrace_disasm.h: plugins/generate_xtrace_disasm.rb pie/riscv.txt pie/a64.txt pie/arm.txt pie/thumb.txt
 	ruby plugins/generate_xtrace_disasm.rb > $@

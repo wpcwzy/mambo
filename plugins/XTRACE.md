@@ -14,8 +14,27 @@ MAMBO_XTRACE_FILE=workload.xtr ./mambo_xtrace ./workload
 ```
 
 `make xtrace` builds both `mambo_xtrace` and `xtrace_decode`. The decoder must
-be built for the trace's ISA because it reuses MAMBO's architecture-specific
-instruction decoder. It may run later or on a separate machine of that ISA.
+be configured for the trace's ISA because it reuses MAMBO's
+architecture-specific instruction decoder.
+
+To decode a 64-bit trace on a different architecture, select the trace ISA
+explicitly. For example, on an x86-64 server decoding an RV64 trace:
+
+```sh
+sudo apt install build-essential ruby libelf-dev libzstd-dev
+make xtrace-decode XTRACE_ARCH=riscv64
+./xtrace_decode workload.xtr pinatrace.out
+```
+
+Use `XTRACE_ARCH=aarch64` for an AArch64 trace. The resulting executable is
+native to the build server; `XTRACE_ARCH` selects the instruction format it
+decodes, not the architecture on which it runs. Use the same MAMBO source
+revision that produced the trace so the recorded instruction enums match.
+
+ARM32 traces additionally require a 32-bit decoder because the current format
+checks the capture and decoder pointer sizes. On an x86-64 server this requires
+a 32-bit toolchain and libraries, normally supplied through `CFLAGS=-m32` and
+the distribution's multilib packages.
 
 Binary capture writes `xtrace.bin` by default. The decoder writes text to
 stdout when its second argument is omitted:
