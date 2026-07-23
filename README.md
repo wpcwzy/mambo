@@ -56,6 +56,16 @@ Prerequisites: an ARM or RISC-V64GC system (physical or virtual) to build and ru
     cd mambo
     make
 
+On RISC-V, support for the V extension is enabled by default. This preserves
+guest vector state across dispatcher transitions. If neither MAMBO nor its
+guests use RVV, it can be disabled to avoid the vector save/restore overhead:
+
+    make RISCV_V=0
+
+`RISCV_V` accepts only `0` or `1`. `RISCV_MARCH` can still override the default
+`rv64gc`/`rv64gcv` ISA string for custom toolchains. When vector support is
+disabled, running guests that use RVV is unsupported.
+
 
 Usage
 -----
