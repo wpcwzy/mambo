@@ -56,6 +56,11 @@ struct xtrace_thread {
   uintptr_t next_pc;
   bool has_next_pc;
   bool instrument_block;
+  bool cached_range_valid;
+  bool cached_range_selected;
+  uintptr_t cached_range_start;
+  uintptr_t cached_range_end;
+  uint64_t cached_range_generation;
   struct xtrace_event *events;
   void *compressed;
   size_t compressed_capacity;
@@ -65,6 +70,12 @@ struct xtrace_thread {
 struct xtrace_function_filter {
   char *name;
   bool matched;
+};
+
+struct xtrace_function_range {
+  uintptr_t start;
+  uintptr_t end;
+  bool selected;
 };
 
 static FILE *xtrace_file;
@@ -84,8 +95,13 @@ static uint64_t xtrace_total_stored_bytes;
 static struct xtrace_function_filter *xtrace_function_filters;
 static size_t xtrace_function_filter_count;
 static size_t xtrace_function_filter_capacity;
+static struct xtrace_function_range *xtrace_function_ranges;
+static size_t xtrace_function_range_count;
+static size_t xtrace_function_range_capacity;
+static uint64_t xtrace_function_range_generation;
 static bool xtrace_selective_capture;
 static pthread_mutex_t xtrace_output_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t xtrace_function_range_lock = PTHREAD_MUTEX_INITIALIZER;
 
 enum xtrace_timestamp_mode {
   XTRACE_TIMESTAMP_NONE,
@@ -266,6 +282,13 @@ static void xtrace_parse_function_file(const char *path) {
   fclose(file);
 }
 
+static int xtrace_compare_function_filters(const void *left,
+                                           const void *right) {
+  const struct xtrace_function_filter *left_filter = left;
+  const struct xtrace_function_filter *right_filter = right;
+  return strcmp(left_filter->name, right_filter->name);
+}
+
 static void xtrace_parse_config(void) {
   const char *functions = getenv("MAMBO_XTRACE_FUNCTIONS");
   const char *function_file = getenv("MAMBO_XTRACE_FUNCTION_FILE");
@@ -279,6 +302,10 @@ static void xtrace_parse_config(void) {
   if (xtrace_selective_capture && xtrace_function_filter_count == 0) {
     fprintf(stderr, "xtrace: selective capture has no function names\n");
     abort();
+  }
+  if (xtrace_function_filter_count > 1) {
+    qsort(xtrace_function_filters, xtrace_function_filter_count,
+          sizeof(*xtrace_function_filters), xtrace_compare_function_filters);
   }
 
   const char *ring = getenv("MAMBO_XTRACE_RING");
@@ -339,29 +366,187 @@ static void xtrace_parse_config(void) {
   }
 }
 
-static bool xtrace_should_instrument(uintptr_t pc) {
+static struct xtrace_function_filter *xtrace_find_function_filter(
+    const char *name) {
+  size_t low = 0;
+  size_t high = xtrace_function_filter_count;
+  while (low < high) {
+    size_t middle = low + (high - low) / 2;
+    int comparison = strcmp(name, xtrace_function_filters[middle].name);
+    if (comparison == 0) {
+      return &xtrace_function_filters[middle];
+    }
+    if (comparison < 0) {
+      high = middle;
+    } else {
+      low = middle + 1;
+    }
+  }
+  return NULL;
+}
+
+static ssize_t xtrace_find_function_range(uintptr_t pc) {
+  size_t low = 0;
+  size_t high = xtrace_function_range_count;
+  while (low < high) {
+    size_t middle = low + (high - low) / 2;
+    if (xtrace_function_ranges[middle].start <= pc) {
+      low = middle + 1;
+    } else {
+      high = middle;
+    }
+  }
+
+  if (low != 0 && pc < xtrace_function_ranges[low - 1].end) {
+    return (ssize_t)(low - 1);
+  }
+  return -1;
+}
+
+static void xtrace_add_function_range(uintptr_t start, uintptr_t end,
+                                      bool selected) {
+  size_t low = 0;
+  size_t high = xtrace_function_range_count;
+  while (low < high) {
+    size_t middle = low + (high - low) / 2;
+    if (xtrace_function_ranges[middle].start < start) {
+      low = middle + 1;
+    } else {
+      high = middle;
+    }
+  }
+
+  if (low < xtrace_function_range_count &&
+      xtrace_function_ranges[low].start == start &&
+      xtrace_function_ranges[low].end == end) {
+    xtrace_function_ranges[low].selected = selected;
+    return;
+  }
+
+  if (xtrace_function_range_count == xtrace_function_range_capacity) {
+    size_t capacity = xtrace_function_range_capacity == 0
+                          ? 64
+                          : xtrace_function_range_capacity * 2;
+    void *ranges = realloc(xtrace_function_ranges,
+                           capacity * sizeof(*xtrace_function_ranges));
+    if (ranges == NULL) {
+      fprintf(stderr, "xtrace: failed to allocate function range cache\n");
+      abort();
+    }
+    xtrace_function_ranges = ranges;
+    xtrace_function_range_capacity = capacity;
+  }
+
+  memmove(&xtrace_function_ranges[low + 1],
+          &xtrace_function_ranges[low],
+          (xtrace_function_range_count - low) *
+              sizeof(*xtrace_function_ranges));
+  xtrace_function_ranges[low] = (struct xtrace_function_range){
+      .start = start,
+      .end = end,
+      .selected = selected,
+  };
+  xtrace_function_range_count++;
+}
+
+static bool xtrace_should_instrument(struct xtrace_thread *thread,
+                                     uintptr_t pc) {
   if (!xtrace_selective_capture) {
     return true;
   }
 
+  uint64_t generation = __atomic_load_n(&xtrace_function_range_generation,
+                                         __ATOMIC_ACQUIRE);
+  if (thread->cached_range_valid &&
+      thread->cached_range_generation == generation &&
+      pc >= thread->cached_range_start && pc < thread->cached_range_end) {
+    return thread->cached_range_selected;
+  }
+
+  int ret = pthread_mutex_lock(&xtrace_function_range_lock);
+  assert(ret == 0);
+  generation = __atomic_load_n(&xtrace_function_range_generation,
+                               __ATOMIC_ACQUIRE);
+
+  ssize_t range_index = xtrace_find_function_range(pc);
+  if (range_index >= 0) {
+    struct xtrace_function_range range =
+        xtrace_function_ranges[range_index];
+    thread->cached_range_valid = true;
+    thread->cached_range_selected = range.selected;
+    thread->cached_range_start = range.start;
+    thread->cached_range_end = range.end;
+    thread->cached_range_generation = generation;
+    ret = pthread_mutex_unlock(&xtrace_function_range_lock);
+    assert(ret == 0);
+    return range.selected;
+  }
+
   char *symbol = NULL;
-  if (get_symbol_info_by_addr(pc, &symbol, NULL, NULL) != 0 ||
-      symbol == NULL) {
+  void *symbol_start = NULL;
+  size_t symbol_size = 0;
+  if (get_symbol_info_by_addr_with_size(pc, &symbol, &symbol_start,
+                                        &symbol_size, NULL) != 0 ||
+      symbol == NULL || symbol_start == NULL || symbol_size == 0) {
     free(symbol);
+    ret = pthread_mutex_unlock(&xtrace_function_range_lock);
+    assert(ret == 0);
+    thread->cached_range_valid = false;
     return false;
   }
 
-  bool selected = false;
-  for (size_t i = 0; i < xtrace_function_filter_count; i++) {
-    if (strcmp(symbol, xtrace_function_filters[i].name) == 0) {
-      __atomic_store_n(&xtrace_function_filters[i].matched, true,
-                       __ATOMIC_RELAXED);
-      selected = true;
-      break;
-    }
+  struct xtrace_function_filter *filter =
+      xtrace_find_function_filter(symbol);
+  bool selected = filter != NULL;
+  if (selected) {
+    __atomic_store_n(&filter->matched, true, __ATOMIC_RELAXED);
   }
   free(symbol);
+
+  uintptr_t start = (uintptr_t)symbol_start;
+  uintptr_t end = symbol_size > UINTPTR_MAX - start
+                      ? UINTPTR_MAX
+                      : start + symbol_size;
+  xtrace_add_function_range(start, end, selected);
+  thread->cached_range_valid = true;
+  thread->cached_range_selected = selected;
+  thread->cached_range_start = start;
+  thread->cached_range_end = end;
+  thread->cached_range_generation = generation;
+
+  ret = pthread_mutex_unlock(&xtrace_function_range_lock);
+  assert(ret == 0);
   return selected;
+}
+
+static int xtrace_vm_op_handler(mambo_context *ctx) {
+  if (!xtrace_selective_capture) {
+    return 0;
+  }
+
+  uintptr_t start = (uintptr_t)mambo_get_vm_addr(ctx);
+  size_t size = mambo_get_vm_size(ctx);
+  uintptr_t end = size > UINTPTR_MAX - start ? UINTPTR_MAX : start + size;
+
+  int ret = pthread_mutex_lock(&xtrace_function_range_lock);
+  assert(ret == 0);
+  size_t write = 0;
+  for (size_t read = 0; read < xtrace_function_range_count; read++) {
+    struct xtrace_function_range range = xtrace_function_ranges[read];
+    if (range.start < end && range.end > start) {
+      continue;
+    }
+    xtrace_function_ranges[write++] = range;
+  }
+  bool invalidated = write != xtrace_function_range_count;
+  xtrace_function_range_count = write;
+  if (invalidated) {
+    __atomic_add_fetch(&xtrace_function_range_generation, 1,
+                       __ATOMIC_RELEASE);
+  }
+  ret = pthread_mutex_unlock(&xtrace_function_range_lock);
+  assert(ret == 0);
+  return 0;
 }
 
 static void xtrace_open_file(void) {
@@ -1952,7 +2137,7 @@ int xtrace_pre_basic_block_handler(mambo_context *ctx) {
   struct xtrace_thread *thread = mambo_get_thread_plugin_data(ctx);
   assert(thread != NULL);
   thread->instrument_block =
-      xtrace_should_instrument(xtrace_source_addr(ctx));
+      xtrace_should_instrument(thread, xtrace_source_addr(ctx));
   return 0;
 }
 
@@ -2042,6 +2227,7 @@ int xtrace_exit_handler(mambo_context *ctx) {
       free(xtrace_function_filters[i].name);
     }
     free(xtrace_function_filters);
+    free(xtrace_function_ranges);
   }
 
   if (xtrace_close_file) {
@@ -2063,6 +2249,9 @@ __attribute__((constructor)) void xtrace_init_plugin(void) {
 
   mambo_register_pre_thread_cb(ctx, &xtrace_pre_thread_handler);
   mambo_register_post_thread_cb(ctx, &xtrace_post_thread_handler);
+  if (xtrace_selective_capture) {
+    mambo_register_vm_op_cb(ctx, &xtrace_vm_op_handler);
+  }
   mambo_register_pre_basic_block_cb(ctx, &xtrace_pre_basic_block_handler);
   mambo_register_pre_inst_cb(ctx, &xtrace_pre_inst_handler);
   mambo_register_post_inst_cb(ctx, &xtrace_post_inst_handler);
