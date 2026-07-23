@@ -33,10 +33,7 @@
 #include "../dbm.h"
 #include "elf_loader.h"
 
-static int get_symbol_info_by_addr_internal(uintptr_t addr, char **sym_name,
-                                            void **start_addr,
-                                            size_t *symbol_size,
-                                            char **filename) {
+int get_symbol_info_by_addr(uintptr_t addr, char **sym_name, void **start_addr, char **filename) {
   interval_map_entry fm;
   int ret = interval_map_search_by_addr(&global_data.exec_allocs, addr, &fm);
   *sym_name = NULL;
@@ -46,54 +43,44 @@ static int get_symbol_info_by_addr_internal(uintptr_t addr, char **sym_name,
   if (filename) {
     *filename = NULL;
   }
-  if (symbol_size) {
-    *symbol_size = 0;
-  }
   if (ret != 1 || fm.fd < 0) return -1;
 
   uintptr_t sym_addr = 0;
-  size_t sym_size = 0;
 
   Elf *elf = elf_begin(fm.fd, ELF_C_READ, NULL);
-  if (elf == NULL) return -1;
+  ELF_EHDR *ehdr;
+  if (elf != NULL) {
+    Elf_Scn *scn = NULL;
+    GElf_Shdr shdr;
+    GElf_Sym sym;
+    ehdr = ELF_GETEHDR(elf);
+    if (ehdr->e_type == ET_DYN) {
+      addr -= fm.start;
+    }
 
-  ELF_EHDR *ehdr = ELF_GETEHDR(elf);
-  if (ehdr == NULL) {
-    ret = elf_end(elf);
-    assert(ret == 0);
-    return -1;
-  }
+    while((scn = elf_nextscn(elf, scn)) != NULL) {
+      gelf_getshdr(scn, &shdr);
+      if(shdr.sh_type == SHT_SYMTAB || shdr.sh_type == SHT_DYNSYM) {
+        Elf_Data *edata = elf_getdata(scn, NULL);
+        assert(edata != NULL);
+        int sym_count = shdr.sh_size / shdr.sh_entsize;
 
-  Elf_Scn *scn = NULL;
-  GElf_Shdr shdr;
-  GElf_Sym sym;
-  if (ehdr->e_type == ET_DYN) {
-    addr -= fm.start;
-  }
-
-  while((scn = elf_nextscn(elf, scn)) != NULL) {
-    gelf_getshdr(scn, &shdr);
-    if(shdr.sh_type == SHT_SYMTAB || shdr.sh_type == SHT_DYNSYM) {
-      Elf_Data *edata = elf_getdata(scn, NULL);
-      assert(edata != NULL);
-      int sym_count = shdr.sh_size / shdr.sh_entsize;
-
-      for (int i = 0; i < sym_count; i++) {
-        gelf_getsym(edata, i, &sym);
-        if (sym.st_value != 0 && ELF32_ST_TYPE(sym.st_info) == STT_FUNC) {
-          if (addr >= sym.st_value && addr < (sym.st_value + sym.st_size)) {
-            sym_addr = sym.st_value;
-            sym_size = sym.st_size;
-            *sym_name = elf_strptr(elf, shdr.sh_link, sym.st_name);
+        for (int i = 0; i < sym_count; i++) {
+          gelf_getsym(edata, i, &sym);
+          if (sym.st_value != 0 && ELF32_ST_TYPE(sym.st_info) == STT_FUNC) {
+            if (addr >= sym.st_value && addr < (sym.st_value + sym.st_size)) {
+              sym_addr = sym.st_value;
+              *sym_name = elf_strptr(elf, shdr.sh_link, sym.st_name);
+            }
           }
         }
-      }
-    } // shdr.sh_type == SHT_SYMTAB
-  } // while scn iterator
+      } // shdr.sh_type == SHT_SYMTAB
+    } // while scn iterator
 
-  if (*sym_name != NULL) {
-    *sym_name = strdup(*sym_name);
-    assert(*sym_name != NULL);
+    if (*sym_name != NULL) {
+      *sym_name = strdup(*sym_name);
+      assert(*sym_name != NULL);
+    }
   }
 
   if (start_addr) {
@@ -101,9 +88,6 @@ static int get_symbol_info_by_addr_internal(uintptr_t addr, char **sym_name,
       sym_addr += fm.start;
     }
     *start_addr = (void *)sym_addr;
-  }
-  if (symbol_size) {
-    *symbol_size = sym_size;
   }
 
   if (filename != NULL) {
@@ -124,19 +108,6 @@ static int get_symbol_info_by_addr_internal(uintptr_t addr, char **sym_name,
   assert(ret == 0);
 
   return 0;
-}
-
-int get_symbol_info_by_addr(uintptr_t addr, char **sym_name, void **start_addr,
-                            char **filename) {
-  return get_symbol_info_by_addr_internal(addr, sym_name, start_addr, NULL,
-                                          filename);
-}
-
-int get_symbol_info_by_addr_with_size(uintptr_t addr, char **sym_name,
-                                      void **start_addr, size_t *symbol_size,
-                                      char **filename) {
-  return get_symbol_info_by_addr_internal(addr, sym_name, start_addr,
-                                          symbol_size, filename);
 }
 
 

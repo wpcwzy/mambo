@@ -20,6 +20,7 @@
 #include <assert.h>
 #include <ctype.h>
 #include <errno.h>
+#include <gelf.h>
 #include <inttypes.h>
 #include <pthread.h>
 #include <stdarg.h>
@@ -27,7 +28,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <time.h>
+#include <unistd.h>
 
 #include "../plugins.h"
 #include "xtrace_disasm.h"
@@ -57,9 +60,9 @@ struct xtrace_thread {
   bool has_next_pc;
   bool instrument_block;
   bool cached_range_valid;
-  bool cached_range_selected;
   uintptr_t cached_range_start;
   uintptr_t cached_range_end;
+  size_t cached_range_filter;
   uint64_t cached_range_generation;
   struct xtrace_event *events;
   void *compressed;
@@ -75,7 +78,7 @@ struct xtrace_function_filter {
 struct xtrace_function_range {
   uintptr_t start;
   uintptr_t end;
-  bool selected;
+  size_t filter_index;
 };
 
 static FILE *xtrace_file;
@@ -404,7 +407,7 @@ static ssize_t xtrace_find_function_range(uintptr_t pc) {
 }
 
 static void xtrace_add_function_range(uintptr_t start, uintptr_t end,
-                                      bool selected) {
+                                      size_t filter_index) {
   size_t low = 0;
   size_t high = xtrace_function_range_count;
   while (low < high) {
@@ -419,7 +422,7 @@ static void xtrace_add_function_range(uintptr_t start, uintptr_t end,
   if (low < xtrace_function_range_count &&
       xtrace_function_ranges[low].start == start &&
       xtrace_function_ranges[low].end == end) {
-    xtrace_function_ranges[low].selected = selected;
+    xtrace_function_ranges[low].filter_index = filter_index;
     return;
   }
 
@@ -444,9 +447,119 @@ static void xtrace_add_function_range(uintptr_t start, uintptr_t end,
   xtrace_function_ranges[low] = (struct xtrace_function_range){
       .start = start,
       .end = end,
-      .selected = selected,
+      .filter_index = filter_index,
   };
   xtrace_function_range_count++;
+}
+
+static bool xtrace_elf_load_bias(Elf *elf, uintptr_t map_start,
+                                 off_t map_offset, uintptr_t *load_bias) {
+  GElf_Ehdr header;
+  if (gelf_getehdr(elf, &header) == NULL) {
+    return false;
+  }
+  if (header.e_type == ET_EXEC) {
+    *load_bias = 0;
+    return true;
+  }
+  if (header.e_type != ET_DYN) {
+    return false;
+  }
+
+  long page_size = sysconf(_SC_PAGESIZE);
+  size_t phdr_count;
+  if (page_size <= 0 || elf_getphdrnum(elf, &phdr_count) != 0) {
+    return false;
+  }
+
+  for (size_t i = 0; i < phdr_count; i++) {
+    GElf_Phdr phdr;
+    if (gelf_getphdr(elf, (int)i, &phdr) == NULL ||
+        phdr.p_type != PT_LOAD) {
+      continue;
+    }
+
+    uintptr_t segment_offset =
+        phdr.p_offset / (uintptr_t)page_size * (uintptr_t)page_size;
+    bool offset_matches = segment_offset == (uintptr_t)map_offset;
+#if defined(__arm__) || (defined(__riscv) && __riscv_xlen == 32)
+    offset_matches = offset_matches ||
+                     segment_offset / (uintptr_t)page_size ==
+                         (uintptr_t)map_offset;
+#endif
+    if (!offset_matches) {
+      continue;
+    }
+
+    uintptr_t segment_vaddr =
+        phdr.p_vaddr / (uintptr_t)page_size * (uintptr_t)page_size;
+    if (map_start < segment_vaddr) {
+      return false;
+    }
+    *load_bias = map_start - segment_vaddr;
+    return true;
+  }
+  return false;
+}
+
+static void xtrace_load_function_ranges(int fd, uintptr_t map_start,
+                                        uintptr_t map_end, off_t map_offset) {
+  Elf *elf = elf_begin(fd, ELF_C_READ, NULL);
+  if (elf == NULL || elf_kind(elf) != ELF_K_ELF) {
+    if (elf != NULL) {
+      elf_end(elf);
+    }
+    return;
+  }
+
+  uintptr_t load_bias;
+  if (!xtrace_elf_load_bias(elf, map_start, map_offset, &load_bias)) {
+    elf_end(elf);
+    return;
+  }
+
+  Elf_Scn *section = NULL;
+  while ((section = elf_nextscn(elf, section)) != NULL) {
+    GElf_Shdr section_header;
+    if (gelf_getshdr(section, &section_header) == NULL ||
+        (section_header.sh_type != SHT_SYMTAB &&
+         section_header.sh_type != SHT_DYNSYM) ||
+        section_header.sh_entsize == 0) {
+      continue;
+    }
+
+    Elf_Data *data = elf_getdata(section, NULL);
+    assert(data != NULL);
+    size_t symbol_count = section_header.sh_size / section_header.sh_entsize;
+    for (size_t i = 0; i < symbol_count; i++) {
+      GElf_Sym symbol;
+      if (gelf_getsym(data, (int)i, &symbol) == NULL ||
+          GELF_ST_TYPE(symbol.st_info) != STT_FUNC ||
+          symbol.st_value == 0 || symbol.st_size == 0) {
+        continue;
+      }
+
+      const char *name =
+          elf_strptr(elf, section_header.sh_link, symbol.st_name);
+      struct xtrace_function_filter *filter =
+          name == NULL ? NULL : xtrace_find_function_filter(name);
+      if (filter == NULL || symbol.st_value > UINTPTR_MAX - load_bias) {
+        continue;
+      }
+
+      uintptr_t start = load_bias + symbol.st_value;
+      uintptr_t end = symbol.st_size > UINTPTR_MAX - start
+                          ? UINTPTR_MAX
+                          : start + symbol.st_size;
+      if (start < map_end && end > map_start) {
+        xtrace_add_function_range(
+            start, end, (size_t)(filter - xtrace_function_filters));
+      }
+    }
+  }
+
+  int ret = elf_end(elf);
+  assert(ret == 0);
 }
 
 static bool xtrace_should_instrument(struct xtrace_thread *thread,
@@ -460,7 +573,10 @@ static bool xtrace_should_instrument(struct xtrace_thread *thread,
   if (thread->cached_range_valid &&
       thread->cached_range_generation == generation &&
       pc >= thread->cached_range_start && pc < thread->cached_range_end) {
-    return thread->cached_range_selected;
+    __atomic_store_n(
+        &xtrace_function_filters[thread->cached_range_filter].matched, true,
+        __ATOMIC_RELAXED);
+    return true;
   }
 
   int ret = pthread_mutex_lock(&xtrace_function_range_lock);
@@ -473,50 +589,21 @@ static bool xtrace_should_instrument(struct xtrace_thread *thread,
     struct xtrace_function_range range =
         xtrace_function_ranges[range_index];
     thread->cached_range_valid = true;
-    thread->cached_range_selected = range.selected;
     thread->cached_range_start = range.start;
     thread->cached_range_end = range.end;
+    thread->cached_range_filter = range.filter_index;
     thread->cached_range_generation = generation;
+    __atomic_store_n(&xtrace_function_filters[range.filter_index].matched,
+                     true, __ATOMIC_RELAXED);
     ret = pthread_mutex_unlock(&xtrace_function_range_lock);
     assert(ret == 0);
-    return range.selected;
+    return true;
   }
 
-  char *symbol = NULL;
-  void *symbol_start = NULL;
-  size_t symbol_size = 0;
-  if (get_symbol_info_by_addr_with_size(pc, &symbol, &symbol_start,
-                                        &symbol_size, NULL) != 0 ||
-      symbol == NULL || symbol_start == NULL || symbol_size == 0) {
-    free(symbol);
-    ret = pthread_mutex_unlock(&xtrace_function_range_lock);
-    assert(ret == 0);
-    thread->cached_range_valid = false;
-    return false;
-  }
-
-  struct xtrace_function_filter *filter =
-      xtrace_find_function_filter(symbol);
-  bool selected = filter != NULL;
-  if (selected) {
-    __atomic_store_n(&filter->matched, true, __ATOMIC_RELAXED);
-  }
-  free(symbol);
-
-  uintptr_t start = (uintptr_t)symbol_start;
-  uintptr_t end = symbol_size > UINTPTR_MAX - start
-                      ? UINTPTR_MAX
-                      : start + symbol_size;
-  xtrace_add_function_range(start, end, selected);
-  thread->cached_range_valid = true;
-  thread->cached_range_selected = selected;
-  thread->cached_range_start = start;
-  thread->cached_range_end = end;
-  thread->cached_range_generation = generation;
-
+  thread->cached_range_valid = false;
   ret = pthread_mutex_unlock(&xtrace_function_range_lock);
   assert(ret == 0);
-  return selected;
+  return false;
 }
 
 static int xtrace_vm_op_handler(mambo_context *ctx) {
@@ -540,6 +627,12 @@ static int xtrace_vm_op_handler(mambo_context *ctx) {
   }
   bool invalidated = write != xtrace_function_range_count;
   xtrace_function_range_count = write;
+  if (mambo_get_vm_op(ctx) == VM_MAP &&
+      (mambo_get_vm_prot(ctx) & PROT_EXEC) != 0 &&
+      mambo_get_vm_filedes(ctx) >= 0) {
+    xtrace_load_function_ranges(mambo_get_vm_filedes(ctx), start, end,
+                                (off_t)mambo_get_vm_off(ctx));
+  }
   if (invalidated) {
     __atomic_add_fetch(&xtrace_function_range_generation, 1,
                        __ATOMIC_RELEASE);

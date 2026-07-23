@@ -79,16 +79,16 @@ MAMBO_XTRACE_FUNCTION_FILE=perf-hot-functions.txt \
   MAMBO_XTRACE_FILE=hot.xtr ./mambo_xtrace ./workload
 ```
 
-The filter is applied while MAMBO translates each basic block. Symbol lookup is
-cached by function address range, so each encountered function is resolved at
-most once. Blocks outside the selected function bodies receive no xtrace
-instrumentation, rather than a runtime check, so their execution does not pay
-the per-instruction tracing cost. Calls made by a selected function are not
-traced unless the callee is also selected. Function names must match the ELF
-symbol table exactly; use mangled names for C++, and retain symbols in the
-binaries being measured. Xtrace reports every configured name that did not
-match translated executable code, either because its symbol was unavailable or
-the function was not run.
+The filter resolves the configured function ranges once when each executable
+ELF mapping is loaded. Basic-block translation then performs only an address
+range lookup; it does not scan the ELF symbol table. Blocks outside the selected
+function bodies receive no xtrace instrumentation, rather than a runtime check,
+so their execution does not pay the per-instruction tracing cost. Calls made by
+a selected function are not traced unless the callee is also selected. Function
+names must match the ELF symbol table exactly; use mangled names for C++, and
+retain symbols in the binaries being measured. Xtrace reports every configured
+name that did not match translated executable code, either because its symbol
+was unavailable or the function was not run.
 
 If both filter variables are set their names are combined. If neither is set,
 xtrace retains whole-program capture behavior.

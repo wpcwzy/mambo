@@ -301,9 +301,6 @@ mambo_branch_type mambo_get_branch_type(mambo_context *ctx);
 
 /* Symbol-related functions */
 int get_symbol_info_by_addr(uintptr_t addr, char **sym_name, void **start_addr, char **filename);
-int get_symbol_info_by_addr_with_size(uintptr_t addr, char **sym_name,
-                                      void **start_addr, size_t *symbol_size,
-                                      char **filename);
 typedef int (*stack_frame_handler)(void *data, void *addr, char *sym_name, void *symbol_start_addr, char *filename);
 int get_backtrace(stack_frame_t *fp, stack_frame_handler handler, void *ptr);
 
