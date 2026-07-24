@@ -26,10 +26,18 @@ make xtrace-decode XTRACE_ARCH=riscv64
 ./xtrace_decode workload.xtr pinatrace.out
 ```
 
-Use `XTRACE_ARCH=aarch64` for an AArch64 trace. The resulting executable is
-native to the build server; `XTRACE_ARCH` selects the instruction format it
-decodes, not the architecture on which it runs. Use the same MAMBO source
-revision that produced the trace so the recorded instruction enums match.
+Use `XTRACE_ARCH=aarch64` for an AArch64 trace:
+
+```sh
+make xtrace-decode XTRACE_ARCH=aarch64
+./xtrace_decode workload.xtr pinatrace.out
+```
+
+The resulting executable is native to the build server; `XTRACE_ARCH` selects
+the instruction format it decodes, not the architecture on which it runs. An
+AArch64 trace can therefore be decoded on any 64-bit host. Use the same MAMBO
+source revision that produced the trace so the recorded instruction enums
+match.
 
 ARM32 traces additionally require a 32-bit decoder because the current format
 checks the capture and decoder pointer sizes. On an x86-64 server this requires
