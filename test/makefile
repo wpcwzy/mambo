@@ -20,6 +20,8 @@ aarch32: portable hw_div
 
 aarch64: portable
 
+riscv64: mmap_munmap mprotect_exec riscv_jump_trampoline
+
 hw_div: hw_div.S
 	$(CC) -mcpu=cortex-a15 $< $(LDFLAGS) -o $@
 
@@ -32,5 +34,8 @@ signals: $(PIE_ENCODER) signals.c signals.S
 load_store: $(PIE_ENCODER) $(PIE_DECODER) load_store.c load_store.S
 	$(CC) -g $(CFLAGS) $^ $(LDFLAGS) -o $@
 
+riscv_jump_trampoline: riscv_jump_trampoline.c
+	$(CC) $(CFLAGS) $< -o $@
+
 clean:
-	rm -f mmap_munmap mprotect_exec self_modifying signals hw_div load_store
+	rm -f mmap_munmap mprotect_exec self_modifying signals hw_div load_store riscv_jump_trampoline

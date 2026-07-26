@@ -76,6 +76,11 @@
 #define MAX_BACK_INLINE 5
 #define MAX_TRACE_FRAGMENTS 20
 
+#if defined(__riscv) && defined(DBM_JUMP_TRAMPOLINES)
+#define RISCV_TRAMPOLINE_SLOTS 6
+#define RISCV_TRAMPOLINE_MAX_DISTANCE (3 * 1024 * 1024)
+#endif
+
 #define RAS_SIZE (4096*5)
 #define TBB_TARGET_REACHED_SIZE 30
 
@@ -194,6 +199,10 @@ typedef struct {
   uint32_t rd;
   int inst;
   uint16_t *read_addr;
+#ifdef DBM_JUMP_TRAMPOLINES
+  uint16_t *trampoline_addr;
+  uint8_t trampoline_slots_used;
+#endif
 #endif
   uint32_t free_b;
   ll_entry *linked_from;
@@ -268,6 +277,9 @@ struct dbm_thread_s {
   int       trace_id;
   int       trace_fragment_count;
   trace_in_prog active_trace;
+#endif
+#if defined(__riscv) && defined(DBM_JUMP_TRAMPOLINE_DEBUG)
+  unsigned int jump_trampoline_links;
 #endif
 
   ll *cc_links;

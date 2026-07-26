@@ -104,6 +104,9 @@ static void *mambo_internal_mmap(size_t size, int prot, int flags, size_t alignm
 void flush_code_cache(dbm_thread *thread_data) {
   thread_data->was_flushed = true;
   thread_data->free_block = trampolines_size_bbs;
+#if defined(__riscv) && defined(DBM_JUMP_TRAMPOLINE_DEBUG)
+  thread_data->jump_trampoline_links = 0;
+#endif
   hash_init(&thread_data->entry_address, CODE_CACHE_HASH_SIZE + CODE_CACHE_HASH_OVERP);
 #ifdef DBM_TRACES
   thread_data->trace_cache_next = thread_data->code_cache->traces;
@@ -120,6 +123,10 @@ void flush_code_cache(dbm_thread *thread_data) {
     thread_data->exec_count[i] = 0;
 #endif
 #ifdef __riscv
+#ifdef DBM_JUMP_TRAMPOLINES
+    thread_data->code_cache_meta[i].trampoline_addr = NULL;
+    thread_data->code_cache_meta[i].trampoline_slots_used = 0;
+#endif
 #if defined DBM_TRACES && DBM_TRIBI
     thread_data->code_cache_meta[i].next_prediction_slot = NULL;
     thread_data->code_cache_meta[i].number_of_predictions = 0;
@@ -390,6 +397,10 @@ int unregister_thread(dbm_thread *thread_data, bool caller_has_lock) {
 
 void dbm_exit(dbm_thread *thread_data, uint32_t code) {
   info("We're done; exiting with status: %d\n", code);
+#if defined(__riscv) && defined(DBM_JUMP_TRAMPOLINE_DEBUG)
+  info("RISC-V jump-trampoline links: %u\n",
+       thread_data->jump_trampoline_links);
+#endif
 
 #ifdef PLUGINS_NEW
   lock_thread_list();
