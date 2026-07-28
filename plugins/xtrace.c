@@ -42,6 +42,12 @@
 #define XTRACE_INFO_LOAD 1
 #define XTRACE_INFO_STORE 2
 #define XTRACE_INFO_SIZE_SHIFT 2
+/* VChase patch: access events for RVV vector mem ops carry only the base
+ * register address (per-element addresses are not recoverable at instrumentation
+ * time).  The value snapshot must therefore be elided: dereferencing the base
+ * is semantically wrong and, for indexed gathers compiled with an rs1=x0
+ * absolute-address idiom, segfaults. */
+#define XTRACE_INFO_RVV (1UL << 63)
 #define XTRACE_INST_META_INST_BITS 24
 #define XTRACE_INST_META_INST_MASK ((uintptr_t)((1u << XTRACE_INST_META_INST_BITS) - 1))
 #define XTRACE_MAX_BYTE_VALUE 16
@@ -2593,6 +2599,7 @@ void xtrace_record_access_pre(struct xtrace_thread *thread, uintptr_t pc,
                               uintptr_t addr, uintptr_t info) {
   (void)pc;
   uintptr_t size = info >> XTRACE_INFO_SIZE_SHIFT;
+  bool is_rvv_access = (info & XTRACE_INFO_RVV) != 0;
 
   if (info & XTRACE_INFO_LOAD) {
     if (xtrace_binary) {
@@ -2603,11 +2610,17 @@ void xtrace_record_access_pre(struct xtrace_thread *thread, uintptr_t pc,
           .size = size > UINT16_MAX ? UINT16_MAX : (uint16_t)size,
           .type = XTRACE_EVENT_LOAD,
       };
-      xtrace_capture_value(event, addr, size);
+      if (!is_rvv_access) {
+        xtrace_capture_value(event, addr, size);
+      }
     } else {
       fprintf(xtrace_file, " - LD %" PRIuPTR " M[%" PRIxPTR "] -> ",
               size * 8, addr);
-      xtrace_print_mem_value(addr, size);
+      if (is_rvv_access) {
+        fprintf(xtrace_file, "<vector>");
+      } else {
+        xtrace_print_mem_value(addr, size);
+      }
       fprintf(xtrace_file, "\n");
     }
   }
@@ -2625,6 +2638,7 @@ void xtrace_record_store_post(struct xtrace_thread *thread) {
   }
 
   uintptr_t size = thread->store_info >> XTRACE_INFO_SIZE_SHIFT;
+  bool is_rvv_access = (thread->store_info & XTRACE_INFO_RVV) != 0;
   if (xtrace_binary) {
     struct xtrace_event *event = xtrace_next_event(thread);
     *event = (struct xtrace_event){
@@ -2633,11 +2647,17 @@ void xtrace_record_store_post(struct xtrace_thread *thread) {
         .size = size > UINT16_MAX ? UINT16_MAX : (uint16_t)size,
         .type = XTRACE_EVENT_STORE,
     };
-    xtrace_capture_value(event, thread->store_addr, size);
+    if (!is_rvv_access) {
+      xtrace_capture_value(event, thread->store_addr, size);
+    }
   } else {
     fprintf(xtrace_file, " - ST %" PRIuPTR " M[%" PRIxPTR "] <- ",
             size * 8, thread->store_addr);
-    xtrace_print_mem_value(thread->store_addr, size);
+    if (is_rvv_access) {
+      fprintf(xtrace_file, "<vector>");
+    } else {
+      xtrace_print_mem_value(thread->store_addr, size);
+    }
     fprintf(xtrace_file, "\n");
   }
 
@@ -2711,6 +2731,9 @@ int xtrace_pre_inst_handler(mambo_context *ctx) {
     if (is_store) {
       emit_riscv_ori(ctx, a3, a3, XTRACE_INFO_STORE);
     }
+    /* VChase patch: tag RVV access so record path skips the value snapshot */
+    emit_set_reg(ctx, a1, XTRACE_INFO_RVV);
+    emit_riscv_or(ctx, a3, a3, a1);
   } else {
     emit_set_reg(ctx, a3,
                  ((uintptr_t)size << XTRACE_INFO_SIZE_SHIFT) |
