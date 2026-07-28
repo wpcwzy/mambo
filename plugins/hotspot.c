@@ -22,6 +22,7 @@
 #include <stdio.h>
 #include <assert.h>
 #include <inttypes.h>
+#include <stdlib.h>
 
 #include <sys/mman.h>
 
@@ -36,6 +37,19 @@
 #endif
 
 #define HOTSTAT_TABLE_SIZE (1 << 14)
+
+#ifndef HOTSTAT_TOP_K
+  #define HOTSTAT_TOP_K 10
+#endif
+
+#if HOTSTAT_TOP_K < 1
+  #error "HOTSTAT_TOP_K must be greater than zero"
+#endif
+
+typedef struct {
+  char *name;
+  uint64_t calls;
+} hotstat_function_freq_t;
 
 // When HOTSTAT_RESTRICT_ADDR is disabled the hotstat plugin follows all basic
 // blocks executed by the application, including calls to the system libraries.
@@ -190,12 +204,78 @@ int hotstat_pre_basic_block_cb(mambo_context* ctx) {
   emit_counter64_incr(ctx, counter, 1);
 }
 
+static void hotstat_print_top_functions(mambo_context *ctx,
+                                        mambo_ht_t *basic_block_freq) {
+  hotstat_function_freq_t *functions;
+  size_t function_count = 0;
+
+  functions = mambo_alloc(ctx, basic_block_freq->entry_count * sizeof(*functions));
+  if(functions == NULL && basic_block_freq->entry_count != 0) {
+    fprintf(stderr, "Hotstat: Couldn't allocate the function frequency table!\n");
+    exit(1);
+  }
+
+  // A function invocation enters its symbol's first basic block. Only retain
+  // those entry blocks; summing every block in a function would overcount calls.
+  for(size_t i = 0; i < basic_block_freq->size; i++) {
+    uintptr_t addr = basic_block_freq->entries[i].key;
+    char *sym_name = NULL;
+    void *symbol_start_addr = NULL;
+
+    if(addr == 0) {
+      continue;
+    }
+
+    if(get_symbol_info_by_addr(addr, &sym_name, &symbol_start_addr, NULL) != 0 ||
+        sym_name == NULL || symbol_start_addr == NULL ||
+        addr != (uintptr_t) symbol_start_addr) {
+      free(sym_name);
+      continue;
+    }
+
+    functions[function_count].name = sym_name;
+    functions[function_count].calls =
+        *(uint64_t *) basic_block_freq->entries[i].value;
+    function_count++;
+  }
+
+  printf("************** Top %d function call counts **************\n",
+      HOTSTAT_TOP_K);
+  printf("**********************************************************\n");
+
+  for(size_t rank = 0; rank < HOTSTAT_TOP_K && rank < function_count; rank++) {
+    size_t max_idx = rank;
+
+    for(size_t i = rank + 1; i < function_count; i++) {
+      if(functions[i].calls > functions[max_idx].calls) {
+        max_idx = i;
+      }
+    }
+
+    hotstat_function_freq_t function = functions[max_idx];
+    functions[max_idx] = functions[rank];
+    functions[rank] = function;
+
+    printf("%zu. %s called %" PRIu64 " times\n", rank + 1,
+        functions[rank].name, functions[rank].calls);
+  }
+
+  printf("**********************************************************\n");
+
+  for(size_t i = 0; i < function_count; i++) {
+    free(functions[i].name);
+  }
+  mambo_free(ctx, functions);
+}
+
 int hotstat_exit_cb(mambo_context* ctx) {
   mambo_ht_t* global_basic_block_freq = (mambo_ht_t*) mambo_get_plugin_data(ctx);
   if(global_basic_block_freq == NULL) {
     fprintf(stderr, "Hotstat: Couldn't get the plugin data!\n");
     exit(1);
   }
+
+  hotstat_print_top_functions(ctx, global_basic_block_freq);
 
   printf("************** Basic blocks execution count **************\n");
   printf("**********************************************************\n");

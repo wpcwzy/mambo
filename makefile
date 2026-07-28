@@ -6,6 +6,7 @@
 #PLUGINS+=plugins/poc_log_returns.c
 #PLUGINS+=plugins/instruction_mix.c
 #PLUGINS+=plugins/strace.c
+#PLUGINS+=plugins/xtrace.c
 #PLUGINS+=plugins/symbol_example.c
 #PLUGINS+=plugins/memcheck/memcheck.S plugins/memcheck/memcheck.c plugins/memcheck/naive_stdlib.c
 #PLUGINS+=plugins/follow_exec.c
@@ -32,13 +33,35 @@ CFLAGS+=-DVERSION=\"$(VERSION)\"
 
 LDFLAGS+=-static -ldl
 LIBS=-lelf -lzstd -lpthread -lz
-HEADERS=*.h makefile
+HEADERS=*.h makefile plugins/xtrace_disasm.h plugins/xtrace_format.h plugins/xtrace_zstd.h
 INCLUDES=-I/usr/include/libelf -I.
 SOURCES= common.c dbm.c traces.c syscalls.c dispatcher.c util.S traces_common.c
 SOURCES+=api/helpers.c api/plugin_support.c api/branch_decoder_support.c api/load_store.c api/internal.c api/hash_table.c
 SOURCES+=elf/elf_loader.o elf/symbol_parser.o
 
 ARCH=$(shell $(CC) -dumpmachine | awk -F '-' '{print $$1}')
+XTRACE_ARCH?=$(ARCH)
+
+ifneq ($(filter riscv riscv64,$(XTRACE_ARCH)),)
+	XTRACE_PIE_ARCH=riscv
+	XTRACE_DECODER_CFLAGS=-D__riscv=1 -D__riscv_xlen=64
+	XTRACE_DECODER_PIE=pie/pie-riscv-decoder.o pie/pie-riscv-field-decoder.o
+	XTRACE_DECODER_HEADERS=api/emit_riscv.h
+endif
+ifneq ($(filter a64 aarch64,$(XTRACE_ARCH)),)
+	XTRACE_PIE_ARCH=a64
+	XTRACE_DECODER_CFLAGS=-D__aarch64__=1
+	XTRACE_DECODER_PIE=pie/pie-a64-decoder.o pie/pie-a64-field-decoder.o
+	XTRACE_DECODER_HEADERS=api/emit_a64.h
+endif
+ifneq ($(filter arm arm32,$(XTRACE_ARCH)),)
+	XTRACE_PIE_ARCH=arm
+	XTRACE_DECODER_CFLAGS=-D__arm__=1
+	XTRACE_DECODER_PIE=pie/pie-arm-decoder.o pie/pie-arm-field-decoder.o
+	XTRACE_DECODER_PIE+=pie/pie-thumb-decoder.o pie/pie-thumb-field-decoder.o
+	XTRACE_DECODER_HEADERS=api/emit_arm.h api/emit_thumb.h
+endif
+
 ifeq ($(findstring arm, $(ARCH)), arm)
 	CFLAGS += -march=armv7-a -mfpu=neon
 	LDFLAGS += -Wl,-Ttext-segment=$(or $(TEXT_SEGMENT),0xa8000000)
@@ -60,12 +83,17 @@ ifeq ($(ARCH),aarch64)
 	SOURCES += signals.c
 endif
 ifeq ($(ARCH), riscv64)
-	# Build with the V extension so __riscv_vector is defined. This enables the
-	# guest vector-state save/restore (push_v/pop_v) in the dispatcher; without
-	# it, MAMBO clobbers the guest's vtype/vl/vstart/v0-v31 across every
-	# dispatcher round-trip, corrupting any guest that uses RVV. Overridable via
-	# RISCV_MARCH for hosts without the V extension.
-	CFLAGS += -march=$(or $(RISCV_MARCH),rv64gcv)
+	# Vector support preserves guest vector state, but adds save/restore overhead
+	# to dispatcher transitions. Disable it only when guests do not use RVV.
+	RISCV_V ?= 1
+ifeq ($(RISCV_V),1)
+	RISCV_DEFAULT_MARCH=rv64gcv
+else ifeq ($(RISCV_V),0)
+	RISCV_DEFAULT_MARCH=rv64gc
+else
+$(error RISCV_V must be 0 or 1)
+endif
+	CFLAGS += -march=$(or $(RISCV_MARCH),$(RISCV_DEFAULT_MARCH))
 	HEADERS += api/emit_riscv.h
 	LDFLAGS += -Wl,-Ttext-segment=$(or $(TEXT_SEGMENT),0x7f000000)
 	PIE += pie/pie-riscv-field-decoder.o
@@ -81,7 +109,7 @@ ifdef PLUGINS
 	CFLAGS += -DPLUGINS_NEW
 endif
 
-.PHONY: pie clean cleanall
+.PHONY: pie clean cleanall xtrace xtrace-decode xtrace-decode-pie xtrace-decode-headers
 
 all:
 	$(info MAMBO: detected architecture "$(ARCH)")
@@ -108,8 +136,28 @@ cachesim:
 memcheck:
 	PLUGINS="plugins/memcheck/memcheck.S plugins/memcheck/memcheck.c plugins/memcheck/naive_stdlib.c" OUTPUT_FILE=mambo_memcheck make
 
+xtrace:
+	$(MAKE) PLUGINS="plugins/xtrace.c" OUTPUT_FILE=mambo_xtrace
+	$(MAKE) xtrace-decode
+
+xtrace-decode-pie:
+	@test -n "$(XTRACE_PIE_ARCH)" || { \
+		echo "Unsupported XTRACE_ARCH '$(XTRACE_ARCH)' (use riscv64, aarch64, or arm32)" >&2; \
+		exit 2; \
+	}
+	$(MAKE) --no-print-directory -C pie/ ARCH=$(XTRACE_PIE_ARCH) CC="$(CC)" pie
+
+xtrace-decode-headers: xtrace-decode-pie
+	$(MAKE) --no-print-directory $(XTRACE_DECODER_HEADERS)
+
+xtrace-decode: xtrace-decode-headers plugins/xtrace_disasm.h plugins/xtrace_format.h plugins/xtrace_zstd.h plugins/xtrace.c
+	$(CC) $(CFLAGS) $(INCLUDES) $(XTRACE_DECODER_CFLAGS) -DXTRACE_DECODER -o xtrace_decode plugins/xtrace.c $(XTRACE_DECODER_PIE) $(or $(ZSTD_LIB),-lzstd)
+
+plugins/xtrace_disasm.h: plugins/generate_xtrace_disasm.rb pie/riscv.txt pie/a64.txt pie/arm.txt pie/thumb.txt
+	ruby plugins/generate_xtrace_disasm.rb > $@
+
 clean:
-	rm -f dbm elf/elf_loader.o elf/symbol_parser.o
+	rm -f dbm xtrace_decode elf/elf_loader.o elf/symbol_parser.o plugins/xtrace_disasm.h
 
 cleanall: clean
 	$(MAKE) -C pie/ clean
