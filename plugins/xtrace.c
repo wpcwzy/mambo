@@ -18,9 +18,7 @@
 #if defined(PLUGINS_NEW) || defined(XTRACE_DECODER)
 
 #include <assert.h>
-#include <ctype.h>
 #include <errno.h>
-#include <gelf.h>
 #include <inttypes.h>
 #include <pthread.h>
 #include <stdarg.h>
@@ -28,9 +26,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/mman.h>
 #include <time.h>
-#include <unistd.h>
 
 #include "../plugins.h"
 #include "xtrace_disasm.h"
@@ -42,12 +38,6 @@
 #define XTRACE_INFO_LOAD 1
 #define XTRACE_INFO_STORE 2
 #define XTRACE_INFO_SIZE_SHIFT 2
-/* VChase patch: access events for RVV vector mem ops carry only the base
- * register address (per-element addresses are not recoverable at instrumentation
- * time).  The value snapshot must therefore be elided: dereferencing the base
- * is semantically wrong and, for indexed gathers compiled with an rs1=x0
- * absolute-address idiom, segfaults. */
-#define XTRACE_INFO_RVV (1UL << 63)
 #define XTRACE_INST_META_INST_BITS 24
 #define XTRACE_INST_META_INST_MASK ((uintptr_t)((1u << XTRACE_INST_META_INST_BITS) - 1))
 #define XTRACE_MAX_BYTE_VALUE 16
@@ -64,27 +54,10 @@ struct xtrace_thread {
   uint64_t instruction_count;
   uintptr_t next_pc;
   bool has_next_pc;
-  bool instrument_block;
-  bool cached_range_valid;
-  uintptr_t cached_range_start;
-  uintptr_t cached_range_end;
-  size_t cached_range_filter;
-  uint64_t cached_range_generation;
   struct xtrace_event *events;
   void *compressed;
   size_t compressed_capacity;
   ZSTD_CCtx *compression_ctx;
-};
-
-struct xtrace_function_filter {
-  char *name;
-  bool matched;
-};
-
-struct xtrace_function_range {
-  uintptr_t start;
-  uintptr_t end;
-  size_t filter_index;
 };
 
 static FILE *xtrace_file;
@@ -101,16 +74,27 @@ static uint32_t xtrace_next_thread_id;
 static uint64_t xtrace_total_events;
 static uint64_t xtrace_total_raw_bytes;
 static uint64_t xtrace_total_stored_bytes;
-static struct xtrace_function_filter *xtrace_function_filters;
-static size_t xtrace_function_filter_count;
-static size_t xtrace_function_filter_capacity;
-static struct xtrace_function_range *xtrace_function_ranges;
-static size_t xtrace_function_range_count;
-static size_t xtrace_function_range_capacity;
-static uint64_t xtrace_function_range_generation;
-static bool xtrace_selective_capture;
 static pthread_mutex_t xtrace_output_lock = PTHREAD_MUTEX_INITIALIZER;
-static pthread_mutex_t xtrace_function_range_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/* MAMBO_XTRACE_PC_RANGES: record ONLY instructions whose guest PC falls in
+ * one of these inclusive [start, end] ranges.  The values are guest addresses
+ * from the native LLC-miss profile's top-miss regions — NOT symbol names, so
+ * the no-source premise holds.  Empty (default) = record everything.
+ * Ranges must cover whole hot loops (not just miss PCs) so the decoded trace
+ * keeps each loop's control flow and the detector can identify it. */
+typedef struct {
+  uintptr_t start, end;
+} xtrace_pc_range;
+static xtrace_pc_range *xtrace_ranges;
+static int xtrace_n_ranges;
+
+static inline bool xtrace_pc_filtered(uintptr_t pc) {
+  if (xtrace_n_ranges == 0) return false;         /* no filter: record all */
+  for (int i = 0; i < xtrace_n_ranges; i++)
+    if (pc >= xtrace_ranges[i].start && pc <= xtrace_ranges[i].end)
+      return false;                               /* in a range: record */
+  return true;                                    /* outside all: skip */
+}
 
 enum xtrace_timestamp_mode {
   XTRACE_TIMESTAMP_NONE,
@@ -206,117 +190,7 @@ static int xtrace_meta_inst(uintptr_t meta) {
 }
 
 #ifndef XTRACE_DECODER
-static void xtrace_add_function_filter(const char *value, size_t length) {
-  while (length != 0 && isspace((unsigned char)*value)) {
-    value++;
-    length--;
-  }
-  while (length != 0 && isspace((unsigned char)value[length - 1])) {
-    length--;
-  }
-  if (length == 0) {
-    return;
-  }
-
-  for (size_t i = 0; i < xtrace_function_filter_count; i++) {
-    if (strlen(xtrace_function_filters[i].name) == length &&
-        strncmp(xtrace_function_filters[i].name, value, length) == 0) {
-      return;
-    }
-  }
-
-  if (xtrace_function_filter_count == xtrace_function_filter_capacity) {
-    size_t capacity = xtrace_function_filter_capacity == 0
-                          ? 8
-                          : xtrace_function_filter_capacity * 2;
-    void *filters = realloc(xtrace_function_filters,
-                            capacity * sizeof(*xtrace_function_filters));
-    if (filters == NULL) {
-      fprintf(stderr, "xtrace: failed to allocate function filters\n");
-      abort();
-    }
-    xtrace_function_filters = filters;
-    xtrace_function_filter_capacity = capacity;
-  }
-
-  char *name = strndup(value, length);
-  if (name == NULL) {
-    fprintf(stderr, "xtrace: failed to allocate a function filter\n");
-    abort();
-  }
-  xtrace_function_filters[xtrace_function_filter_count++] =
-      (struct xtrace_function_filter){.name = name};
-}
-
-static void xtrace_parse_function_list(const char *list) {
-  const char *start = list;
-  for (const char *cursor = list;; cursor++) {
-    if (*cursor == ',' || *cursor == '\0') {
-      xtrace_add_function_filter(start, (size_t)(cursor - start));
-      if (*cursor == '\0') {
-        break;
-      }
-      start = cursor + 1;
-    }
-  }
-}
-
-static void xtrace_parse_function_file(const char *path) {
-  FILE *file = fopen(path, "r");
-  if (file == NULL) {
-    fprintf(stderr, "xtrace: failed to open function file %s: %s\n", path,
-            strerror(errno));
-    abort();
-  }
-
-  char *line = NULL;
-  size_t capacity = 0;
-  while (getline(&line, &capacity, file) >= 0) {
-    char *content = line;
-    while (isspace((unsigned char)*content)) {
-      content++;
-    }
-    if (*content != '\0' && *content != '#') {
-      xtrace_parse_function_list(content);
-    }
-  }
-  if (ferror(file)) {
-    fprintf(stderr, "xtrace: failed to read function file %s: %s\n", path,
-            strerror(errno));
-    free(line);
-    fclose(file);
-    abort();
-  }
-  free(line);
-  fclose(file);
-}
-
-static int xtrace_compare_function_filters(const void *left,
-                                           const void *right) {
-  const struct xtrace_function_filter *left_filter = left;
-  const struct xtrace_function_filter *right_filter = right;
-  return strcmp(left_filter->name, right_filter->name);
-}
-
 static void xtrace_parse_config(void) {
-  const char *functions = getenv("MAMBO_XTRACE_FUNCTIONS");
-  const char *function_file = getenv("MAMBO_XTRACE_FUNCTION_FILE");
-  xtrace_selective_capture = functions != NULL || function_file != NULL;
-  if (functions != NULL && functions[0] != '\0') {
-    xtrace_parse_function_list(functions);
-  }
-  if (function_file != NULL && function_file[0] != '\0') {
-    xtrace_parse_function_file(function_file);
-  }
-  if (xtrace_selective_capture && xtrace_function_filter_count == 0) {
-    fprintf(stderr, "xtrace: selective capture has no function names\n");
-    abort();
-  }
-  if (xtrace_function_filter_count > 1) {
-    qsort(xtrace_function_filters, xtrace_function_filter_count,
-          sizeof(*xtrace_function_filters), xtrace_compare_function_filters);
-  }
-
   const char *ring = getenv("MAMBO_XTRACE_RING");
   if (ring != NULL && ring[0] != '\0') {
     xtrace_ring_level = atoi(ring);
@@ -373,279 +247,48 @@ static void xtrace_parse_config(void) {
   if (level != NULL && level[0] != '\0') {
     xtrace_compression_level = atoi(level);
   }
-}
 
-static struct xtrace_function_filter *xtrace_find_function_filter(
-    const char *name) {
-  size_t low = 0;
-  size_t high = xtrace_function_filter_count;
-  while (low < high) {
-    size_t middle = low + (high - low) / 2;
-    int comparison = strcmp(name, xtrace_function_filters[middle].name);
-    if (comparison == 0) {
-      return &xtrace_function_filters[middle];
-    }
-    if (comparison < 0) {
-      high = middle;
-    } else {
-      low = middle + 1;
-    }
-  }
-  return NULL;
-}
-
-static ssize_t xtrace_find_function_range(uintptr_t pc) {
-  size_t low = 0;
-  size_t high = xtrace_function_range_count;
-  while (low < high) {
-    size_t middle = low + (high - low) / 2;
-    if (xtrace_function_ranges[middle].start <= pc) {
-      low = middle + 1;
-    } else {
-      high = middle;
-    }
-  }
-
-  if (low != 0 && pc < xtrace_function_ranges[low - 1].end) {
-    return (ssize_t)(low - 1);
-  }
-  return -1;
-}
-
-static void xtrace_add_function_range(uintptr_t start, uintptr_t end,
-                                      size_t filter_index) {
-  size_t low = 0;
-  size_t high = xtrace_function_range_count;
-  while (low < high) {
-    size_t middle = low + (high - low) / 2;
-    if (xtrace_function_ranges[middle].start < start) {
-      low = middle + 1;
-    } else {
-      high = middle;
-    }
-  }
-
-  if (low < xtrace_function_range_count &&
-      xtrace_function_ranges[low].start == start &&
-      xtrace_function_ranges[low].end == end) {
-    xtrace_function_ranges[low].filter_index = filter_index;
-    return;
-  }
-
-  if (xtrace_function_range_count == xtrace_function_range_capacity) {
-    size_t capacity = xtrace_function_range_capacity == 0
-                          ? 64
-                          : xtrace_function_range_capacity * 2;
-    void *ranges = realloc(xtrace_function_ranges,
-                           capacity * sizeof(*xtrace_function_ranges));
-    if (ranges == NULL) {
-      fprintf(stderr, "xtrace: failed to allocate function range cache\n");
-      abort();
-    }
-    xtrace_function_ranges = ranges;
-    xtrace_function_range_capacity = capacity;
-  }
-
-  memmove(&xtrace_function_ranges[low + 1],
-          &xtrace_function_ranges[low],
-          (xtrace_function_range_count - low) *
-              sizeof(*xtrace_function_ranges));
-  xtrace_function_ranges[low] = (struct xtrace_function_range){
-      .start = start,
-      .end = end,
-      .filter_index = filter_index,
-  };
-  xtrace_function_range_count++;
-}
-
-static bool xtrace_elf_load_bias(Elf *elf, uintptr_t map_start,
-                                 off_t map_offset, uintptr_t *load_bias) {
-  GElf_Ehdr header;
-  if (gelf_getehdr(elf, &header) == NULL) {
-    return false;
-  }
-  if (header.e_type == ET_EXEC) {
-    *load_bias = 0;
-    return true;
-  }
-  if (header.e_type != ET_DYN) {
-    return false;
-  }
-
-  long page_size = sysconf(_SC_PAGESIZE);
-  size_t phdr_count;
-  if (page_size <= 0 || elf_getphdrnum(elf, &phdr_count) != 0) {
-    return false;
-  }
-
-  for (size_t i = 0; i < phdr_count; i++) {
-    GElf_Phdr phdr;
-    if (gelf_getphdr(elf, (int)i, &phdr) == NULL ||
-        phdr.p_type != PT_LOAD) {
-      continue;
-    }
-
-    uintptr_t segment_offset =
-        phdr.p_offset / (uintptr_t)page_size * (uintptr_t)page_size;
-    bool offset_matches = segment_offset == (uintptr_t)map_offset;
-#if defined(__arm__) || (defined(__riscv) && __riscv_xlen == 32)
-    offset_matches = offset_matches ||
-                     segment_offset / (uintptr_t)page_size ==
-                         (uintptr_t)map_offset;
-#endif
-    if (!offset_matches) {
-      continue;
-    }
-
-    uintptr_t segment_vaddr =
-        phdr.p_vaddr / (uintptr_t)page_size * (uintptr_t)page_size;
-    if (map_start < segment_vaddr) {
-      return false;
-    }
-    *load_bias = map_start - segment_vaddr;
-    return true;
-  }
-  return false;
-}
-
-static void xtrace_load_function_ranges(int fd, uintptr_t map_start,
-                                        uintptr_t map_end, off_t map_offset) {
-  Elf *elf = elf_begin(fd, ELF_C_READ, NULL);
-  if (elf == NULL || elf_kind(elf) != ELF_K_ELF) {
-    if (elf != NULL) {
-      elf_end(elf);
-    }
-    return;
-  }
-
-  uintptr_t load_bias;
-  if (!xtrace_elf_load_bias(elf, map_start, map_offset, &load_bias)) {
-    elf_end(elf);
-    return;
-  }
-
-  Elf_Scn *section = NULL;
-  while ((section = elf_nextscn(elf, section)) != NULL) {
-    GElf_Shdr section_header;
-    if (gelf_getshdr(section, &section_header) == NULL ||
-        (section_header.sh_type != SHT_SYMTAB &&
-         section_header.sh_type != SHT_DYNSYM) ||
-        section_header.sh_entsize == 0) {
-      continue;
-    }
-
-    Elf_Data *data = elf_getdata(section, NULL);
-    assert(data != NULL);
-    size_t symbol_count = section_header.sh_size / section_header.sh_entsize;
-    for (size_t i = 0; i < symbol_count; i++) {
-      GElf_Sym symbol;
-      if (gelf_getsym(data, (int)i, &symbol) == NULL ||
-          GELF_ST_TYPE(symbol.st_info) != STT_FUNC ||
-          symbol.st_value == 0 || symbol.st_size == 0) {
-        continue;
+  const char *ranges = getenv("MAMBO_XTRACE_PC_RANGES");
+  if (ranges != NULL && ranges[0] != '\0') {
+    const char *p = ranges;
+    while (*p) {
+      const char *comma = strchr(p, ',');
+      size_t len = comma ? (size_t)(comma - p) : strlen(p);
+      char buf[128];
+      if (len == 0) { p += comma ? (len + 1) : len; continue; }
+      if (len >= sizeof(buf)) break;
+      memcpy(buf, p, len);
+      buf[len] = '\0';
+      uintptr_t a = 0, b = 0;
+      char *dash = strchr(buf, '-');
+      if (dash) {
+        *dash = '\0';
+        a = strtoull(buf, NULL, 0);
+        b = strtoull(dash + 1, NULL, 0);
+      } else {
+        a = b = strtoull(buf, NULL, 0);
       }
-
-      const char *name =
-          elf_strptr(elf, section_header.sh_link, symbol.st_name);
-      struct xtrace_function_filter *filter =
-          name == NULL ? NULL : xtrace_find_function_filter(name);
-      if (filter == NULL || symbol.st_value > UINTPTR_MAX - load_bias) {
-        continue;
+      if (b >= a) {
+        xtrace_pc_range *nr = realloc(
+            xtrace_ranges,
+            (size_t)(xtrace_n_ranges + 1) * sizeof(*nr));
+        if (nr) {
+          xtrace_ranges = nr;
+          xtrace_ranges[xtrace_n_ranges].start = a;
+          xtrace_ranges[xtrace_n_ranges].end = b;
+          xtrace_n_ranges++;
+        }
       }
-
-      uintptr_t start = load_bias + symbol.st_value;
-      uintptr_t end = symbol.st_size > UINTPTR_MAX - start
-                          ? UINTPTR_MAX
-                          : start + symbol.st_size;
-      if (start < map_end && end > map_start) {
-        xtrace_add_function_range(
-            start, end, (size_t)(filter - xtrace_function_filters));
-      }
+      p += comma ? (len + 1) : len;
+    }
+    if (xtrace_n_ranges) {
+      fprintf(stderr, "xtrace: recording %d PC range(s):", xtrace_n_ranges);
+      for (int i = 0; i < xtrace_n_ranges; i++)
+        fprintf(stderr, " 0x%" PRIxPTR "-0x%" PRIxPTR,
+                xtrace_ranges[i].start, xtrace_ranges[i].end);
+      fprintf(stderr, "\n");
     }
   }
-
-  int ret = elf_end(elf);
-  assert(ret == 0);
-}
-
-static bool xtrace_should_instrument(struct xtrace_thread *thread,
-                                     uintptr_t pc) {
-  if (!xtrace_selective_capture) {
-    return true;
-  }
-
-  uint64_t generation = __atomic_load_n(&xtrace_function_range_generation,
-                                         __ATOMIC_ACQUIRE);
-  if (thread->cached_range_valid &&
-      thread->cached_range_generation == generation &&
-      pc >= thread->cached_range_start && pc < thread->cached_range_end) {
-    __atomic_store_n(
-        &xtrace_function_filters[thread->cached_range_filter].matched, true,
-        __ATOMIC_RELAXED);
-    return true;
-  }
-
-  int ret = pthread_mutex_lock(&xtrace_function_range_lock);
-  assert(ret == 0);
-  generation = __atomic_load_n(&xtrace_function_range_generation,
-                               __ATOMIC_ACQUIRE);
-
-  ssize_t range_index = xtrace_find_function_range(pc);
-  if (range_index >= 0) {
-    struct xtrace_function_range range =
-        xtrace_function_ranges[range_index];
-    thread->cached_range_valid = true;
-    thread->cached_range_start = range.start;
-    thread->cached_range_end = range.end;
-    thread->cached_range_filter = range.filter_index;
-    thread->cached_range_generation = generation;
-    __atomic_store_n(&xtrace_function_filters[range.filter_index].matched,
-                     true, __ATOMIC_RELAXED);
-    ret = pthread_mutex_unlock(&xtrace_function_range_lock);
-    assert(ret == 0);
-    return true;
-  }
-
-  thread->cached_range_valid = false;
-  ret = pthread_mutex_unlock(&xtrace_function_range_lock);
-  assert(ret == 0);
-  return false;
-}
-
-static int xtrace_vm_op_handler(mambo_context *ctx) {
-  if (!xtrace_selective_capture) {
-    return 0;
-  }
-
-  uintptr_t start = (uintptr_t)mambo_get_vm_addr(ctx);
-  size_t size = mambo_get_vm_size(ctx);
-  uintptr_t end = size > UINTPTR_MAX - start ? UINTPTR_MAX : start + size;
-
-  int ret = pthread_mutex_lock(&xtrace_function_range_lock);
-  assert(ret == 0);
-  size_t write = 0;
-  for (size_t read = 0; read < xtrace_function_range_count; read++) {
-    struct xtrace_function_range range = xtrace_function_ranges[read];
-    if (range.start < end && range.end > start) {
-      continue;
-    }
-    xtrace_function_ranges[write++] = range;
-  }
-  bool invalidated = write != xtrace_function_range_count;
-  xtrace_function_range_count = write;
-  if (mambo_get_vm_op(ctx) == VM_MAP &&
-      (mambo_get_vm_prot(ctx) & PROT_EXEC) != 0 &&
-      mambo_get_vm_filedes(ctx) >= 0) {
-    xtrace_load_function_ranges(mambo_get_vm_filedes(ctx), start, end,
-                                (off_t)mambo_get_vm_off(ctx));
-  }
-  if (invalidated) {
-    __atomic_add_fetch(&xtrace_function_range_generation, 1,
-                       __ATOMIC_RELEASE);
-  }
-  ret = pthread_mutex_unlock(&xtrace_function_range_lock);
-  assert(ret == 0);
-  return 0;
 }
 
 static void xtrace_open_file(void) {
@@ -760,386 +403,87 @@ static const char *xtrace_a64_gpr(unsigned int reg, bool wide) {
   return wide ? xnames[reg] : wnames[reg];
 }
 
-static const char *xtrace_a64_cond(unsigned int cond) {
+static const char *xtrace_a64_vec(unsigned int reg) {
   static const char *const names[] = {
-      "eq", "ne", "cs", "cc", "mi", "pl", "vs", "vc",
-      "hi", "ls", "ge", "lt", "gt", "le", "al", "nv",
+    "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7",
+    "v8", "v9", "v10", "v11", "v12", "v13", "v14", "v15",
+    "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23",
+    "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31"
   };
-  return cond < 16 ? names[cond] : "?";
+  return reg < 32 ? names[reg] : "v?";
 }
 
-static const char *xtrace_a64_shift(unsigned int shift) {
-  static const char *const names[] = {"lsl", "lsr", "asr", "ror"};
-  return shift < 4 ? names[shift] : "?";
+static bool xtrace_a64_encoding_is_load(uintptr_t encoding) {
+  return (encoding & (1u << 22)) != 0;
 }
 
-static const char *xtrace_a64_extend(unsigned int option) {
-  static const char *const names[] = {
-      "uxtb", "uxth", "uxtw", "uxtx", "sxtb", "sxth", "sxtw", "sxtx",
-  };
-  return option < 8 ? names[option] : "?";
+static bool xtrace_a64_ldr_str_is_load(uintptr_t encoding) {
+  return ((encoding >> 22) & 3) != 0;
 }
 
-static uintptr_t xtrace_a64_target(uintptr_t pc, int64_t offset) {
-  return (uintptr_t)((intptr_t)pc + offset);
-}
-
-static uint64_t xtrace_a64_ror(uint64_t value, unsigned int amount,
-                               unsigned int width) {
-  uint64_t mask = width == 64 ? UINT64_MAX : (1ull << width) - 1;
-  amount &= width - 1;
-  value &= mask;
-  if (amount == 0) {
-    return value;
-  }
-  return ((value >> amount) | (value << (width - amount))) & mask;
-}
-
-static bool xtrace_a64_logical_immediate(unsigned int sf, unsigned int n,
-                                         unsigned int immr,
-                                         unsigned int imms,
-                                         uint64_t *value) {
-  unsigned int pattern = (n << 6) | ((~imms) & 0x3f);
-  int len = -1;
-  for (int bit = 6; bit >= 0; bit--) {
-    if ((pattern & (1u << bit)) != 0) {
-      len = bit;
-      break;
-    }
-  }
-  if (len < 1) {
-    return false;
-  }
-
-  unsigned int levels = (1u << len) - 1;
-  unsigned int s = imms & levels;
-  unsigned int r = immr & levels;
-  unsigned int width = 1u << len;
-  if (s == levels || (!sf && width == 64)) {
-    return false;
-  }
-
-  uint64_t element = s == 63 ? UINT64_MAX : (1ull << (s + 1)) - 1;
-  element = xtrace_a64_ror(element, r, width);
-  uint64_t result = 0;
-  unsigned int reg_width = sf ? 64 : 32;
-  for (unsigned int bit = 0; bit < reg_width; bit += width) {
-    result |= element << bit;
-  }
-  *value = result;
-  return true;
-}
-
-static const char *xtrace_a64_load_store_mnemonic(unsigned int size,
-                                                   unsigned int v,
-                                                   unsigned int opc) {
-  if (v != 0) {
-    return opc == 0 ? "str" : "ldr";
-  }
-  if (opc == 0) {
-    return size == 0 ? "strb" : size == 1 ? "strh" : "str";
-  }
-  if (opc == 1) {
-    return size == 0 ? "ldrb" : size == 1 ? "ldrh" : "ldr";
-  }
-  if (opc == 2) {
-    return size == 0 ? "ldrsb" : size == 1 ? "ldrsh" : "ldrsw";
-  }
-  return size == 0 ? "ldrsb" : size == 1 ? "ldrsh" : "prfm";
-}
-
-static const char *xtrace_a64_mnemonic(int inst, uint32_t encoding) {
+static const char *xtrace_a64_mnemonic(int inst, uintptr_t encoding) {
   switch ((a64_instruction)inst) {
-    case A64_CBZ_CBNZ:
-      return ((encoding >> 24) & 1) != 0 ? "cbnz" : "cbz";
-    case A64_B_COND:
-      return "b";
-    case A64_TBZ_TBNZ:
-      return ((encoding >> 24) & 1) != 0 ? "tbnz" : "tbz";
-    case A64_B_BL:
-      return ((encoding >> 31) & 1) != 0 ? "bl" : "b";
-    case A64_HINT: {
-      static const char *const names[] = {
-          "nop", "yield", "wfe", "wfi", "sev", "sevl",
-      };
-      unsigned int hint = (encoding >> 5) & 0x7f;
-      return hint < sizeof(names) / sizeof(names[0]) ? names[hint] : "hint";
-    }
-    case A64_MRS_MSR_REG:
-      return ((encoding >> 21) & 1) != 0 ? "mrs" : "msr";
     case A64_LDR_LIT:
-      return xtrace_a64_load_store_mnemonic(2, (encoding >> 26) & 1,
-                                            (encoding >> 30) & 3);
+      return "ldr";
     case A64_LDR_STR_IMMED:
     case A64_LDR_STR_REG:
     case A64_LDR_STR_UNSIGNED_IMMED:
-      return xtrace_a64_load_store_mnemonic((encoding >> 30) & 3,
-                                            (encoding >> 26) & 1,
-                                            (encoding >> 22) & 3);
-    case A64_LDP_STP: {
-      unsigned int type = (encoding >> 23) & 3;
-      bool load = ((encoding >> 22) & 1) != 0;
-      if (type == 0) {
-        return load ? "ldnp" : "stnp";
-      }
-      if (load && ((encoding >> 30) & 3) == 1 &&
-          ((encoding >> 26) & 1) == 0) {
-        return "ldpsw";
-      }
-      return load ? "ldp" : "stp";
-    }
-    case A64_LDX_STX: {
-      bool pair = ((encoding >> 10) & 0x1f) != 31;
-      unsigned int o2 = (encoding >> 23) & 1;
-      unsigned int l = (encoding >> 22) & 1;
-      unsigned int o1 = (encoding >> 21) & 1;
-      unsigned int o0 = (encoding >> 15) & 1;
-      if (o2 != 0) {
-        if (o0 && o1) return "casal";
-        if (o0) return "casa";
-        if (o1) return "casl";
-        return "cas";
-      }
-      if (l != 0) {
-        if (pair) return o0 ? "ldaxp" : "ldxp";
-        return o0 ? "ldaxr" : "ldxr";
-      }
-      if (pair) return o0 ? "stlxp" : "stxp";
-      return o0 ? "stlxr" : "stxr";
-    }
+      return xtrace_a64_ldr_str_is_load(encoding) ? "ldr" : "str";
+    case A64_LDP_STP:
+      return xtrace_a64_encoding_is_load(encoding) ? "ldp" : "stp";
+    case A64_LDX_STX:
+      return xtrace_a64_encoding_is_load(encoding) ? "ldxr" : "stxr";
     case A64_LDX_STX_MULTIPLE:
     case A64_LDX_STX_MULTIPLE_POST:
     case A64_LDX_STX_SINGLE:
     case A64_LDX_STX_SINGLE_POST:
-      return ((encoding >> 22) & 1) != 0 ? "ld1" : "st1";
-    case A64_ADD_SUB_IMMED:
-    case A64_ADD_SUB_EXT_REG:
-    case A64_ADD_SUB_SHIFT_REG: {
-      unsigned int op = (encoding >> 30) & 1;
-      unsigned int s = (encoding >> 29) & 1;
-      static const char *const names[2][2] = {
-          {"add", "adds"}, {"sub", "subs"},
-      };
-      return names[op][s];
-    }
-    case A64_ADC_SBC: {
-      unsigned int op = (encoding >> 30) & 1;
-      unsigned int s = (encoding >> 29) & 1;
-      static const char *const names[2][2] = {
-          {"adc", "adcs"}, {"sbc", "sbcs"},
-      };
-      return names[op][s];
-    }
-    case A64_CCMP_CCMN_IMMED:
-    case A64_CCMP_CCMN_REG:
-      return ((encoding >> 30) & 1) != 0 ? "ccmp" : "ccmn";
-    case A64_LOGICAL_IMMED:
-    case A64_LOGICAL_REG: {
-      unsigned int opc = (encoding >> 29) & 3;
-      unsigned int n = inst == A64_LOGICAL_REG ? (encoding >> 21) & 1 : 0;
-      static const char *const names[4][2] = {
-          {"and", "bic"}, {"orr", "orn"}, {"eor", "eon"},
-          {"ands", "bics"},
-      };
-      return names[opc][n];
-    }
-    case A64_MOV_WIDE: {
-      static const char *const names[] = {"movn", "unknown", "movz", "movk"};
-      return names[(encoding >> 29) & 3];
-    }
-    case A64_ADR:
-      return ((encoding >> 31) & 1) != 0 ? "adrp" : "adr";
-    case A64_BFM: {
-      static const char *const names[] = {"sbfm", "bfm", "ubfm", "unknown"};
-      return names[(encoding >> 29) & 3];
-    }
-    case A64_COND_SELECT: {
-      unsigned int op = (encoding >> 30) & 1;
-      unsigned int op2 = (encoding >> 10) & 1;
-      static const char *const names[2][2] = {
-          {"csel", "csinc"}, {"csinv", "csneg"},
-      };
-      return names[op][op2];
-    }
-    case A64_DATA_PROC_REG1: {
-      static const char *const names[] = {"rbit", "rev16", "rev32", "rev",
-                                          "clz", "cls"};
-      unsigned int opcode = (encoding >> 10) & 0x3f;
-      return opcode < 6 ? names[opcode] : "data_proc_reg1";
-    }
-    case A64_DATA_PROC_REG2: {
-      switch ((encoding >> 10) & 0x3f) {
-        case 2: return "udiv";
-        case 3: return "sdiv";
-        case 8: return "lslv";
-        case 9: return "lsrv";
-        case 10: return "asrv";
-        case 11: return "rorv";
-        default: return "data_proc_reg2";
-      }
-    }
-    case A64_DATA_PROC_REG3: {
-      unsigned int op31 = (encoding >> 21) & 7;
-      unsigned int o0 = (encoding >> 15) & 1;
-      if (op31 == 0) return o0 ? "msub" : "madd";
-      if (op31 == 1) return o0 ? "smsubl" : "smaddl";
-      if (op31 == 2) return "smulh";
-      if (op31 == 5) return o0 ? "umsubl" : "umaddl";
-      if (op31 == 6) return "umulh";
-      return "data_proc_reg3";
-    }
+      return xtrace_a64_encoding_is_load(encoding) ? "ld1" : "st1";
+    case A64_LDADD:
+      return "ldadd";
+    case A64_LDCLR:
+      return "ldclr";
+    case A64_LDEOR:
+      return "ldeor";
+    case A64_LDSET:
+      return "ldset";
+    case A64_SWP:
+      return "swp";
     default:
       return xtrace_a64_name((a64_instruction)inst);
   }
 }
 
-static void xtrace_append_a64_access_reg(char *buf, size_t cap, size_t *pos,
-                                         unsigned int reg, unsigned int size,
-                                         unsigned int v, unsigned int opc) {
-  if (v == 0) {
-    bool wide = size == 3 || opc == 2;
-    if (opc == 3) {
-      wide = false;
-    }
-    xtrace_appendf(buf, cap, pos, "%s", xtrace_a64_gpr(reg, wide));
-    return;
+static const char *xtrace_a64_access_reg(unsigned int reg, unsigned int size,
+                                         unsigned int v) {
+  if (v != 0) {
+    return xtrace_a64_vec(reg);
   }
-
-  static const char widths[] = {'b', 'h', 's', 'd'};
-  char width = opc == 3 ? 'q' : widths[size & 3];
-  xtrace_appendf(buf, cap, pos, "%c%u", width, reg);
-}
-
-static void xtrace_append_a64_atomic_suffix(char *buf, size_t cap,
-                                             size_t *pos, unsigned int size,
-                                             unsigned int acquire,
-                                             unsigned int release) {
-  xtrace_appendf(buf, cap, pos, "%s%s%s",
-                 acquire ? "a" : "", release ? "l" : "",
-                 size == 0 ? "b" : size == 1 ? "h" : "");
+  return xtrace_a64_gpr(reg, size == 3);
 }
 
 static void xtrace_append_a64_operands(char *buf, size_t cap, size_t *pos,
                                        uintptr_t pc, uintptr_t encoding,
                                        int inst) {
-  uint32_t instruction = (uint32_t)encoding;
+  (void)encoding;
   switch ((a64_instruction)inst) {
-    case A64_CBZ_CBNZ: {
-      unsigned int sf, op, imm19, rt;
-      a64_CBZ_CBNZ_decode_fields(&instruction, &sf, &op, &imm19, &rt);
-      (void)op;
-      int64_t offset = (int64_t)sign_extend64(19, imm19) * 4;
-      xtrace_appendf(buf, cap, pos, " %s, 0x%" PRIxPTR,
-                     xtrace_a64_gpr(rt, sf != 0),
-                     xtrace_a64_target(pc, offset));
-      break;
-    }
-    case A64_B_COND: {
-      unsigned int imm19, cond;
-      a64_B_cond_decode_fields(&instruction, &imm19, &cond);
-      int64_t offset = (int64_t)sign_extend64(19, imm19) * 4;
-      xtrace_appendf(buf, cap, pos, ".%s 0x%" PRIxPTR,
-                     xtrace_a64_cond(cond), xtrace_a64_target(pc, offset));
-      break;
-    }
-    case A64_TBZ_TBNZ: {
-      unsigned int b5, op, b40, imm14, rt;
-      a64_TBZ_TBNZ_decode_fields(&instruction, &b5, &op, &b40, &imm14, &rt);
-      (void)op;
-      unsigned int bit = (b5 << 5) | b40;
-      int64_t offset = (int64_t)sign_extend64(14, imm14) * 4;
-      xtrace_appendf(buf, cap, pos, " %s, #%u, 0x%" PRIxPTR,
-                     xtrace_a64_gpr(rt, b5 != 0), bit,
-                     xtrace_a64_target(pc, offset));
-      break;
-    }
-    case A64_B_BL: {
-      unsigned int op, imm26;
-      a64_B_BL_decode_fields(&instruction, &op, &imm26);
-      (void)op;
-      int64_t offset = (int64_t)sign_extend64(26, imm26) * 4;
-      xtrace_appendf(buf, cap, pos, " 0x%" PRIxPTR,
-                     xtrace_a64_target(pc, offset));
-      break;
-    }
-    case A64_BR:
-    case A64_BLR:
-    case A64_RET: {
-      unsigned int rn;
-      a64_BR_decode_fields(&instruction, &rn);
-      xtrace_appendf(buf, cap, pos, " %s", xtrace_a64_gpr(rn, true));
-      break;
-    }
-    case A64_SVC:
-    case A64_HVC:
-    case A64_SMC:
-    case A64_BRK:
-    case A64_HLT:
-    case A64_DCPS1:
-    case A64_DCPS2:
-    case A64_DCPS3: {
-      unsigned int imm16 = (instruction >> 5) & 0xffff;
-      xtrace_appendf(buf, cap, pos, " #0x%x", imm16);
-      break;
-    }
-    case A64_HINT: {
-      unsigned int hint = (instruction >> 5) & 0x7f;
-      if (hint >= 6) {
-        xtrace_appendf(buf, cap, pos, " #0x%x", hint);
-      }
-      break;
-    }
-    case A64_CLREX:
-    case A64_DSB:
-    case A64_DMB:
-    case A64_ISB: {
-      unsigned int option = (instruction >> 8) & 0xf;
-      xtrace_appendf(buf, cap, pos, " #0x%x", option);
-      break;
-    }
-    case A64_MRS_MSR_REG: {
-      unsigned int r, o0, op1, crn, crm, op2, rt;
-      a64_MRS_MSR_reg_decode_fields(&instruction, &r, &o0, &op1, &crn,
-                                    &crm, &op2, &rt);
-      unsigned int op0 = 2 + o0;
-      if (r != 0) {
-        xtrace_appendf(buf, cap, pos, " %s, s%u_%u_c%u_c%u_%u",
-                       xtrace_a64_gpr(rt, true), op0, op1, crn, crm, op2);
-      } else {
-        xtrace_appendf(buf, cap, pos, " s%u_%u_c%u_c%u_%u, %s",
-                       op0, op1, crn, crm, op2,
-                       xtrace_a64_gpr(rt, true));
-      }
-      break;
-    }
     case A64_LDR_LIT: {
       unsigned int opc, v, imm19, rt;
-      a64_LDR_lit_decode_fields(&instruction, &opc, &v, &imm19, &rt);
-      int64_t offset = (int64_t)sign_extend64(19, imm19) * 4;
-      xtrace_appendf(buf, cap, pos, " ");
-      if (v == 0 && opc == 3) {
-        xtrace_appendf(buf, cap, pos, "#%u", rt);
-      } else if (v != 0) {
-        static const char widths[] = {'s', 'd', 'q'};
-        xtrace_appendf(buf, cap, pos, "%c%u",
-                       opc < 3 ? widths[opc] : '?', rt);
-      } else {
-        xtrace_appendf(buf, cap, pos, "%s",
-                       xtrace_a64_gpr(rt, opc != 0));
-      }
-      xtrace_appendf(buf, cap, pos, ", 0x%" PRIxPTR,
-                     xtrace_a64_target(pc, offset));
+      a64_LDR_lit_decode_fields((uint32_t *)&encoding, &opc, &v, &imm19, &rt);
+      int64_t offset = (int64_t)sign_extend64(19, imm19) << 2;
+      xtrace_appendf(buf, cap, pos, " %s, [pc, #%" PRId64 "]",
+                     v ? xtrace_a64_vec(rt) : xtrace_a64_gpr(rt, opc != 0),
+                     offset);
       break;
     }
     case A64_LDR_STR_UNSIGNED_IMMED: {
       unsigned int size, v, opc, imm12, rn, rt;
-      a64_LDR_STR_unsigned_immed_decode_fields(&instruction, &size, &v,
+      a64_LDR_STR_unsigned_immed_decode_fields((uint32_t *)&encoding, &size, &v,
                                                &opc, &imm12, &rn, &rt);
       unsigned int scale = ((v & (opc >> 1)) << 2) + size;
       uintptr_t offset = (uintptr_t)imm12 << scale;
-      xtrace_appendf(buf, cap, pos, " ");
-      xtrace_append_a64_access_reg(buf, cap, pos, rt, size, v, opc);
-      xtrace_appendf(buf, cap, pos, ", [%s", xtrace_a64_base_reg(rn));
+      xtrace_appendf(buf, cap, pos, " %s, [%s",
+                     xtrace_a64_access_reg(rt, size, v),
+                     xtrace_a64_base_reg(rn));
       if (offset != 0) {
         xtrace_appendf(buf, cap, pos, ", #%" PRIuPTR, offset);
       }
@@ -1148,316 +492,49 @@ static void xtrace_append_a64_operands(char *buf, size_t cap, size_t *pos,
     }
     case A64_LDR_STR_IMMED: {
       unsigned int size, v, opc, imm9, type, rn, rt;
-      a64_LDR_STR_immed_decode_fields(&instruction, &size, &v, &opc,
+      a64_LDR_STR_immed_decode_fields((uint32_t *)&encoding, &size, &v, &opc,
                                       &imm9, &type, &rn, &rt);
       int32_t offset = sign_extend32(9, imm9);
-      xtrace_appendf(buf, cap, pos, " ");
-      xtrace_append_a64_access_reg(buf, cap, pos, rt, size, v, opc);
-      xtrace_appendf(buf, cap, pos, ", [%s", xtrace_a64_base_reg(rn));
-      if (type != 1 && offset != 0) {
+      xtrace_appendf(buf, cap, pos, " %s, [%s",
+                     xtrace_a64_access_reg(rt, size, v),
+                     xtrace_a64_base_reg(rn));
+      if (offset != 0) {
         xtrace_appendf(buf, cap, pos, ", #%" PRId32, offset);
       }
-      xtrace_appendf(buf, cap, pos, "]");
-      if (type == 1) {
-        xtrace_appendf(buf, cap, pos, ", #%" PRId32, offset);
-      } else if (type == 3) {
-        xtrace_appendf(buf, cap, pos, "!");
-      }
+      xtrace_appendf(buf, cap, pos, "]%s", type == 2 ? "!" : "");
       break;
     }
     case A64_LDR_STR_REG: {
       unsigned int size, v, opc, rm, option, s, rn, rt;
-      a64_LDR_STR_reg_decode_fields(&instruction, &size, &v, &opc,
+      (void)opc;
+      (void)option;
+      a64_LDR_STR_reg_decode_fields((uint32_t *)&encoding, &size, &v, &opc,
                                     &rm, &option, &s, &rn, &rt);
-      xtrace_appendf(buf, cap, pos, " ");
-      xtrace_append_a64_access_reg(buf, cap, pos, rt, size, v, opc);
-      xtrace_appendf(buf, cap, pos, ", [%s, %s",
+      xtrace_appendf(buf, cap, pos, " %s, [%s, %s",
+                     xtrace_a64_access_reg(rt, size, v),
                      xtrace_a64_base_reg(rn),
-                     xtrace_a64_gpr(rm, option == 3 || option == 7));
-      if (option == 3) {
-        if (s != 0) {
-          xtrace_appendf(buf, cap, pos, ", lsl #%u", size);
-        }
-      } else {
-        xtrace_appendf(buf, cap, pos, ", %s", xtrace_a64_extend(option));
-        if (s != 0) {
-          xtrace_appendf(buf, cap, pos, " #%u", size);
-        }
+                     xtrace_a64_gpr(rm, true));
+      if (s != 0) {
+        xtrace_appendf(buf, cap, pos, ", lsl #%u", size);
       }
       xtrace_appendf(buf, cap, pos, "]");
       break;
     }
     case A64_LDP_STP: {
       unsigned int opc, v, type, l, imm7, rt2, rn, rt;
-      a64_LDP_STP_decode_fields(&instruction, &opc, &v, &type, &l,
+      (void)type;
+      (void)l;
+      a64_LDP_STP_decode_fields((uint32_t *)&encoding, &opc, &v, &type, &l,
                                 &imm7, &rt2, &rn, &rt);
-      unsigned int scale = v ? 2 + opc : 2 + (opc >> 1);
-      int32_t offset = sign_extend32(7, imm7) * (1u << scale);
-      unsigned int reg_opc = v ? (opc == 2 ? 3 : 0) : (opc == 1 ? 2 : 0);
-      unsigned int reg_size = v ? (opc == 0 ? 2 : 3) : (opc == 0 ? 2 : 3);
-      xtrace_appendf(buf, cap, pos, " ");
-      xtrace_append_a64_access_reg(buf, cap, pos, rt, reg_size, v, reg_opc);
-      xtrace_appendf(buf, cap, pos, ", ");
-      xtrace_append_a64_access_reg(buf, cap, pos, rt2, reg_size, v, reg_opc);
-      xtrace_appendf(buf, cap, pos, ", [%s", xtrace_a64_base_reg(rn));
-      if (type != 1 && offset != 0) {
+      int32_t offset = sign_extend32(7, imm7) << (2 + (opc >> (1 - v)));
+      xtrace_appendf(buf, cap, pos, " %s, %s, [%s",
+                     xtrace_a64_access_reg(rt, 3, v),
+                     xtrace_a64_access_reg(rt2, 3, v),
+                     xtrace_a64_base_reg(rn));
+      if (offset != 0) {
         xtrace_appendf(buf, cap, pos, ", #%" PRId32, offset);
       }
       xtrace_appendf(buf, cap, pos, "]");
-      if (type == 1) {
-        xtrace_appendf(buf, cap, pos, ", #%" PRId32, offset);
-      } else if (type == 3) {
-        xtrace_appendf(buf, cap, pos, "!");
-      }
-      break;
-    }
-    case A64_LDX_STX: {
-      unsigned int size, o2, l, o1, rs, o0, rt2, rn, rt;
-      a64_LDX_STX_decode_fields(&instruction, &size, &o2, &l, &o1, &rs,
-                                &o0, &rt2, &rn, &rt);
-      (void)o1;
-      (void)o0;
-      bool pair = rt2 != 31;
-      (void)o2;
-      xtrace_append_a64_atomic_suffix(buf, cap, pos, size, 0, 0);
-      bool wide = size == 3;
-      if (o2 != 0) {
-        xtrace_appendf(buf, cap, pos, " %s, %s, [%s]",
-                       xtrace_a64_gpr(rs, wide), xtrace_a64_gpr(rt, wide),
-                       xtrace_a64_base_reg(rn));
-      } else if (l != 0) {
-        xtrace_appendf(buf, cap, pos, " %s", xtrace_a64_gpr(rt, wide));
-        if (pair) {
-          xtrace_appendf(buf, cap, pos, ", %s", xtrace_a64_gpr(rt2, wide));
-        }
-        xtrace_appendf(buf, cap, pos, ", [%s]", xtrace_a64_base_reg(rn));
-      } else {
-        xtrace_appendf(buf, cap, pos, " %s, %s",
-                       xtrace_a64_gpr(rs, false), xtrace_a64_gpr(rt, wide));
-        if (pair) {
-          xtrace_appendf(buf, cap, pos, ", %s", xtrace_a64_gpr(rt2, wide));
-        }
-        xtrace_appendf(buf, cap, pos, ", [%s]", xtrace_a64_base_reg(rn));
-      }
-      break;
-    }
-    case A64_LDADD:
-    case A64_LDCLR:
-    case A64_LDEOR:
-    case A64_LDSMAX:
-    case A64_LDSMIN:
-    case A64_LDUMAX:
-    case A64_LDUMIN:
-    case A64_LDSET:
-    case A64_SWP: {
-      unsigned int size = (instruction >> 30) & 3;
-      unsigned int acquire = (instruction >> 23) & 1;
-      unsigned int release = (instruction >> 22) & 1;
-      unsigned int rs = (instruction >> 16) & 0x1f;
-      unsigned int rn = (instruction >> 5) & 0x1f;
-      unsigned int rt = instruction & 0x1f;
-      xtrace_append_a64_atomic_suffix(buf, cap, pos, size,
-                                      acquire, release);
-      xtrace_appendf(buf, cap, pos, " %s, %s, [%s]",
-                     xtrace_a64_gpr(rs, size == 3),
-                     xtrace_a64_gpr(rt, size == 3),
-                     xtrace_a64_base_reg(rn));
-      break;
-    }
-    case A64_ADD_SUB_IMMED: {
-      unsigned int sf, op, s, shift, imm12, rn, rd;
-      a64_ADD_SUB_immed_decode_fields(&instruction, &sf, &op, &s, &shift,
-                                      &imm12, &rn, &rd);
-      (void)op;
-      xtrace_appendf(buf, cap, pos, " %s, %s, #0x%x",
-                     s ? xtrace_a64_gpr(rd, sf) :
-                         (rd == 31 ? xtrace_a64_base_reg(rd) :
-                                    xtrace_a64_gpr(rd, sf)),
-                     rn == 31 ? xtrace_a64_base_reg(rn) :
-                                xtrace_a64_gpr(rn, sf),
-                     imm12);
-      if (shift != 0) {
-        xtrace_appendf(buf, cap, pos, ", lsl #12");
-      }
-      break;
-    }
-    case A64_ADD_SUB_SHIFT_REG: {
-      unsigned int sf, op, s, shift, rm, imm6, rn, rd;
-      a64_ADD_SUB_shift_reg_decode_fields(&instruction, &sf, &op, &s, &shift,
-                                          &rm, &imm6, &rn, &rd);
-      (void)op;
-      (void)s;
-      xtrace_appendf(buf, cap, pos, " %s, %s, %s",
-                     xtrace_a64_gpr(rd, sf), xtrace_a64_gpr(rn, sf),
-                     xtrace_a64_gpr(rm, sf));
-      if (imm6 != 0 || shift != 0) {
-        xtrace_appendf(buf, cap, pos, ", %s #%u",
-                       xtrace_a64_shift(shift), imm6);
-      }
-      break;
-    }
-    case A64_ADD_SUB_EXT_REG: {
-      unsigned int sf, op, s, rm, option, imm3, rn, rd;
-      a64_ADD_SUB_ext_reg_decode_fields(&instruction, &sf, &op, &s, &rm,
-                                        &option, &imm3, &rn, &rd);
-      (void)op;
-      xtrace_appendf(buf, cap, pos, " %s, %s, %s, %s",
-                     s ? xtrace_a64_gpr(rd, sf) :
-                         (rd == 31 ? xtrace_a64_base_reg(rd) :
-                                    xtrace_a64_gpr(rd, sf)),
-                     rn == 31 ? xtrace_a64_base_reg(rn) :
-                                xtrace_a64_gpr(rn, sf),
-                     xtrace_a64_gpr(rm, option == 3 || option == 7),
-                     xtrace_a64_extend(option));
-      if (imm3 != 0) {
-        xtrace_appendf(buf, cap, pos, " #%u", imm3);
-      }
-      break;
-    }
-    case A64_ADC_SBC: {
-      unsigned int sf, op, s, rm, rn, rd;
-      a64_ADC_SBC_decode_fields(&instruction, &sf, &op, &s, &rm, &rn, &rd);
-      (void)op;
-      (void)s;
-      xtrace_appendf(buf, cap, pos, " %s, %s, %s",
-                     xtrace_a64_gpr(rd, sf), xtrace_a64_gpr(rn, sf),
-                     xtrace_a64_gpr(rm, sf));
-      break;
-    }
-    case A64_LOGICAL_IMMED: {
-      unsigned int sf, opc, n, immr, imms, rn, rd;
-      a64_logical_immed_decode_fields(&instruction, &sf, &opc, &n, &immr,
-                                      &imms, &rn, &rd);
-      (void)opc;
-      uint64_t immediate;
-      xtrace_appendf(buf, cap, pos, " %s, %s, ",
-                     xtrace_a64_gpr(rd, sf), xtrace_a64_gpr(rn, sf));
-      if (xtrace_a64_logical_immediate(sf, n, immr, imms, &immediate)) {
-        xtrace_appendf(buf, cap, pos, "#0x%" PRIx64, immediate);
-      } else {
-        xtrace_appendf(buf, cap, pos, "#<invalid>");
-      }
-      break;
-    }
-    case A64_LOGICAL_REG: {
-      unsigned int sf, opc, shift, n, rm, imm6, rn, rd;
-      a64_logical_reg_decode_fields(&instruction, &sf, &opc, &shift, &n,
-                                    &rm, &imm6, &rn, &rd);
-      (void)opc;
-      (void)n;
-      xtrace_appendf(buf, cap, pos, " %s, %s, %s",
-                     xtrace_a64_gpr(rd, sf), xtrace_a64_gpr(rn, sf),
-                     xtrace_a64_gpr(rm, sf));
-      if (imm6 != 0 || shift != 0) {
-        xtrace_appendf(buf, cap, pos, ", %s #%u",
-                       xtrace_a64_shift(shift), imm6);
-      }
-      break;
-    }
-    case A64_MOV_WIDE: {
-      unsigned int sf, opc, hw, imm16, rd;
-      a64_MOV_wide_decode_fields(&instruction, &sf, &opc, &hw, &imm16, &rd);
-      (void)opc;
-      xtrace_appendf(buf, cap, pos, " %s, #0x%x",
-                     xtrace_a64_gpr(rd, sf), imm16);
-      if (hw != 0) {
-        xtrace_appendf(buf, cap, pos, ", lsl #%u", hw * 16);
-      }
-      break;
-    }
-    case A64_ADR: {
-      unsigned int op, immlo, immhi, rd;
-      a64_ADR_decode_fields(&instruction, &op, &immlo, &immhi, &rd);
-      int64_t immediate = sign_extend64(21, (immhi << 2) | immlo);
-      uintptr_t base = op ? pc & ~(uintptr_t)0xfff : pc;
-      if (op) immediate *= 4096;
-      xtrace_appendf(buf, cap, pos, " %s, 0x%" PRIxPTR,
-                     xtrace_a64_gpr(rd, true),
-                     xtrace_a64_target(base, immediate));
-      break;
-    }
-    case A64_BFM: {
-      unsigned int sf, opc, n, immr, imms, rn, rd;
-      a64_BFM_decode_fields(&instruction, &sf, &opc, &n, &immr, &imms,
-                            &rn, &rd);
-      (void)opc;
-      (void)n;
-      xtrace_appendf(buf, cap, pos, " %s, %s, #%u, #%u",
-                     xtrace_a64_gpr(rd, sf), xtrace_a64_gpr(rn, sf),
-                     immr, imms);
-      break;
-    }
-    case A64_EXTR: {
-      unsigned int sf, n, rm, imms, rn, rd;
-      a64_EXTR_decode_fields(&instruction, &sf, &n, &rm, &imms, &rn, &rd);
-      (void)n;
-      xtrace_appendf(buf, cap, pos, " %s, %s, %s, #%u",
-                     xtrace_a64_gpr(rd, sf), xtrace_a64_gpr(rn, sf),
-                     xtrace_a64_gpr(rm, sf), imms);
-      break;
-    }
-    case A64_CCMP_CCMN_IMMED: {
-      unsigned int sf, op, imm5, cond, rn, nzcv;
-      a64_CCMP_CCMN_immed_decode_fields(&instruction, &sf, &op, &imm5,
-                                        &cond, &rn, &nzcv);
-      (void)op;
-      xtrace_appendf(buf, cap, pos, " %s, #%u, #%u, %s",
-                     xtrace_a64_gpr(rn, sf), imm5, nzcv,
-                     xtrace_a64_cond(cond));
-      break;
-    }
-    case A64_CCMP_CCMN_REG: {
-      unsigned int sf, op, rm, cond, rn, nzcv;
-      a64_CCMP_CCMN_reg_decode_fields(&instruction, &sf, &op, &rm, &cond,
-                                      &rn, &nzcv);
-      (void)op;
-      xtrace_appendf(buf, cap, pos, " %s, %s, #%u, %s",
-                     xtrace_a64_gpr(rn, sf), xtrace_a64_gpr(rm, sf), nzcv,
-                     xtrace_a64_cond(cond));
-      break;
-    }
-    case A64_COND_SELECT: {
-      unsigned int sf, op, rm, cond, op2, rn, rd;
-      a64_cond_select_decode_fields(&instruction, &sf, &op, &rm, &cond,
-                                    &op2, &rn, &rd);
-      (void)op;
-      (void)op2;
-      xtrace_appendf(buf, cap, pos, " %s, %s, %s, %s",
-                     xtrace_a64_gpr(rd, sf), xtrace_a64_gpr(rn, sf),
-                     xtrace_a64_gpr(rm, sf), xtrace_a64_cond(cond));
-      break;
-    }
-    case A64_DATA_PROC_REG1: {
-      unsigned int sf, opcode, rn, rd;
-      a64_data_proc_reg1_decode_fields(&instruction, &sf, &opcode, &rn, &rd);
-      (void)opcode;
-      xtrace_appendf(buf, cap, pos, " %s, %s",
-                     xtrace_a64_gpr(rd, sf), xtrace_a64_gpr(rn, sf));
-      break;
-    }
-    case A64_DATA_PROC_REG2: {
-      unsigned int sf, rm, opcode, rn, rd;
-      a64_data_proc_reg2_decode_fields(&instruction, &sf, &rm, &opcode,
-                                       &rn, &rd);
-      (void)opcode;
-      xtrace_appendf(buf, cap, pos, " %s, %s, %s",
-                     xtrace_a64_gpr(rd, sf), xtrace_a64_gpr(rn, sf),
-                     xtrace_a64_gpr(rm, sf));
-      break;
-    }
-    case A64_DATA_PROC_REG3: {
-      unsigned int sf, op31, rm, o0, ra, rn, rd;
-      a64_data_proc_reg3_decode_fields(&instruction, &sf, &op31, &rm, &o0,
-                                       &ra, &rn, &rd);
-      bool long_op = op31 == 1 || op31 == 5;
-      xtrace_appendf(buf, cap, pos, " %s, %s, %s",
-                     xtrace_a64_gpr(rd, sf),
-                     xtrace_a64_gpr(rn, long_op ? false : sf),
-                     xtrace_a64_gpr(rm, long_op ? false : sf));
-      if (op31 != 2 && op31 != 6) {
-        xtrace_appendf(buf, cap, pos, ", %s", xtrace_a64_gpr(ra, sf));
-      }
-      (void)o0;
       break;
     }
     default:
@@ -2543,6 +1620,7 @@ static void xtrace_capture_value(struct xtrace_event *event, uintptr_t addr,
 
 void xtrace_record_inst(struct xtrace_thread *thread, uintptr_t pc,
                         uintptr_t encoding, uintptr_t info) {
+  if (xtrace_pc_filtered(pc)) return;
   uintptr_t inst_len = info & 0xf;
   uintptr_t meta = info >> 4;
 
@@ -2597,9 +1675,8 @@ void xtrace_record_inst(struct xtrace_thread *thread, uintptr_t pc,
 
 void xtrace_record_access_pre(struct xtrace_thread *thread, uintptr_t pc,
                               uintptr_t addr, uintptr_t info) {
-  (void)pc;
+  if (xtrace_pc_filtered(pc)) return;
   uintptr_t size = info >> XTRACE_INFO_SIZE_SHIFT;
-  bool is_rvv_access = (info & XTRACE_INFO_RVV) != 0;
 
   if (info & XTRACE_INFO_LOAD) {
     if (xtrace_binary) {
@@ -2610,17 +1687,11 @@ void xtrace_record_access_pre(struct xtrace_thread *thread, uintptr_t pc,
           .size = size > UINT16_MAX ? UINT16_MAX : (uint16_t)size,
           .type = XTRACE_EVENT_LOAD,
       };
-      if (!is_rvv_access) {
-        xtrace_capture_value(event, addr, size);
-      }
+      xtrace_capture_value(event, addr, size);
     } else {
       fprintf(xtrace_file, " - LD %" PRIuPTR " M[%" PRIxPTR "] -> ",
               size * 8, addr);
-      if (is_rvv_access) {
-        fprintf(xtrace_file, "<vector>");
-      } else {
-        xtrace_print_mem_value(addr, size);
-      }
+      xtrace_print_mem_value(addr, size);
       fprintf(xtrace_file, "\n");
     }
   }
@@ -2638,7 +1709,6 @@ void xtrace_record_store_post(struct xtrace_thread *thread) {
   }
 
   uintptr_t size = thread->store_info >> XTRACE_INFO_SIZE_SHIFT;
-  bool is_rvv_access = (thread->store_info & XTRACE_INFO_RVV) != 0;
   if (xtrace_binary) {
     struct xtrace_event *event = xtrace_next_event(thread);
     *event = (struct xtrace_event){
@@ -2647,17 +1717,11 @@ void xtrace_record_store_post(struct xtrace_thread *thread) {
         .size = size > UINT16_MAX ? UINT16_MAX : (uint16_t)size,
         .type = XTRACE_EVENT_STORE,
     };
-    if (!is_rvv_access) {
-      xtrace_capture_value(event, thread->store_addr, size);
-    }
+    xtrace_capture_value(event, thread->store_addr, size);
   } else {
     fprintf(xtrace_file, " - ST %" PRIuPTR " M[%" PRIxPTR "] <- ",
             size * 8, thread->store_addr);
-    if (is_rvv_access) {
-      fprintf(xtrace_file, "<vector>");
-    } else {
-      xtrace_print_mem_value(thread->store_addr, size);
-    }
+    xtrace_print_mem_value(thread->store_addr, size);
     fprintf(xtrace_file, "\n");
   }
 
@@ -2665,11 +1729,6 @@ void xtrace_record_store_post(struct xtrace_thread *thread) {
 }
 
 int xtrace_pre_inst_handler(mambo_context *ctx) {
-  struct xtrace_thread *thread = mambo_get_thread_plugin_data(ctx);
-  if (!thread->instrument_block) {
-    return 0;
-  }
-
   bool is_load = mambo_is_load(ctx);
   bool is_store = mambo_is_store(ctx);
   bool is_mem = is_load || is_store;
@@ -2731,9 +1790,6 @@ int xtrace_pre_inst_handler(mambo_context *ctx) {
     if (is_store) {
       emit_riscv_ori(ctx, a3, a3, XTRACE_INFO_STORE);
     }
-    /* VChase patch: tag RVV access so record path skips the value snapshot */
-    emit_set_reg(ctx, a1, XTRACE_INFO_RVV);
-    emit_riscv_or(ctx, a3, a3, a1);
   } else {
     emit_set_reg(ctx, a3,
                  ((uintptr_t)size << XTRACE_INFO_SIZE_SHIFT) |
@@ -2773,11 +1829,6 @@ int xtrace_pre_inst_handler(mambo_context *ctx) {
 }
 
 int xtrace_post_inst_handler(mambo_context *ctx) {
-  struct xtrace_thread *thread = mambo_get_thread_plugin_data(ctx);
-  if (!thread->instrument_block) {
-    return 0;
-  }
-
   if (!mambo_is_store(ctx)) {
     return 0;
   }
@@ -2812,14 +1863,6 @@ int xtrace_post_inst_handler(mambo_context *ctx) {
     assert(ret == 0);
   }
 
-  return 0;
-}
-
-int xtrace_pre_basic_block_handler(mambo_context *ctx) {
-  struct xtrace_thread *thread = mambo_get_thread_plugin_data(ctx);
-  assert(thread != NULL);
-  thread->instrument_block =
-      xtrace_should_instrument(thread, xtrace_source_addr(ctx));
   return 0;
 }
 
@@ -2898,20 +1941,6 @@ int xtrace_exit_handler(mambo_context *ctx) {
             xtrace_output_failed ? ", output incomplete" : "");
   }
 
-  if (xtrace_selective_capture) {
-    for (size_t i = 0; i < xtrace_function_filter_count; i++) {
-      if (!__atomic_load_n(&xtrace_function_filters[i].matched,
-                           __ATOMIC_RELAXED)) {
-        fprintf(stderr, "xtrace: function '%s' was not matched in translated "
-                        "executable code (missing symbol or not executed)\n",
-                xtrace_function_filters[i].name);
-      }
-      free(xtrace_function_filters[i].name);
-    }
-    free(xtrace_function_filters);
-    free(xtrace_function_ranges);
-  }
-
   if (xtrace_close_file) {
     fclose(xtrace_file);
   }
@@ -2931,10 +1960,6 @@ __attribute__((constructor)) void xtrace_init_plugin(void) {
 
   mambo_register_pre_thread_cb(ctx, &xtrace_pre_thread_handler);
   mambo_register_post_thread_cb(ctx, &xtrace_post_thread_handler);
-  if (xtrace_selective_capture) {
-    mambo_register_vm_op_cb(ctx, &xtrace_vm_op_handler);
-  }
-  mambo_register_pre_basic_block_cb(ctx, &xtrace_pre_basic_block_handler);
   mambo_register_pre_inst_cb(ctx, &xtrace_pre_inst_handler);
   mambo_register_post_inst_cb(ctx, &xtrace_post_inst_handler);
   mambo_register_exit_cb(ctx, &xtrace_exit_handler);
